@@ -29,6 +29,10 @@ use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::{self, ExtIdleNotificationV1},
     ext_idle_notifier_v1::{self, ExtIdleNotifierV1},
 };
+use wayland_protocols::wp::idle_inhibit::zv1::client::{
+    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
+    zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+};
 
 use crate::animation::Animation;
 use crate::renderer::Renderer;
@@ -57,6 +61,7 @@ struct Screensaver {
     window: Window,
     renderer: Option<Renderer>,
     animation: Option<Animation>,
+    inhibitor: Option<ZwpIdleInhibitorV1>,
 }
 
 struct App {
@@ -69,6 +74,7 @@ struct App {
     screensaver: Option<Screensaver>,
     idle_notifier: Option<ExtIdleNotifierV1>,
     idle_notification: Option<ExtIdleNotificationV1>,
+    idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
     seat: Option<wl_seat::WlSeat>,
     font_size: u32,
     hold: u32,
@@ -91,21 +97,29 @@ impl App {
         window.set_app_id("olsvr");
         window.commit();
 
+        // Create idle inhibitor to prevent system sleep while screensaver is active
+        let inhibitor = self
+            .idle_inhibit_manager
+            .as_ref()
+            .map(|mgr| mgr.create_inhibitor(window.wl_surface(), qh, ()));
+
         // Renderer/animation are created in configure callback when we know the size
         self.screensaver = Some(Screensaver {
             window,
             renderer: None,
             animation: None,
+            inhibitor,
         });
     }
 
     fn deactivate(&mut self) {
-        if self.screensaver.is_none() {
-            return;
+        if let Some(ss) = self.screensaver.take() {
+            log::info!("Deactivating screensaver");
+            if let Some(inhibitor) = ss.inhibitor {
+                inhibitor.destroy();
+            }
+            // Drop destroys the window and its Wayland resources
         }
-        log::info!("Deactivating screensaver");
-        // Drop destroys the window and its Wayland resources
-        self.screensaver = None;
     }
 
     fn draw(&mut self) {
@@ -368,6 +382,30 @@ impl Dispatch<ExtIdleNotifierV1, ()> for App {
     }
 }
 
+impl Dispatch<ZwpIdleInhibitManagerV1, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _manager: &ZwpIdleInhibitManagerV1,
+        _event: <ZwpIdleInhibitManagerV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
+impl Dispatch<ZwpIdleInhibitorV1, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _inhibitor: &ZwpIdleInhibitorV1,
+        _event: <ZwpIdleInhibitorV1 as wayland_client::Proxy>::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
+    }
+}
+
 impl ProvidesRegistryState for App {
     fn registry(&mut self) -> &mut RegistryState {
         &mut self.registry_state
@@ -401,6 +439,13 @@ fn main() {
         log::warn!("ext_idle_notifier_v1 not available — idle detection disabled");
     }
 
+    // Bind idle inhibit manager (optional)
+    let idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1> =
+        globals.bind(&qh, 1..=1, ()).ok();
+    if idle_inhibit_manager.is_none() {
+        log::warn!("zwp_idle_inhibit_manager_v1 not available — idle inhibition disabled");
+    }
+
     let mut app = App {
         conn: conn.clone(),
         registry_state: RegistryState::new(&globals),
@@ -411,6 +456,7 @@ fn main() {
         screensaver: None,
         idle_notifier,
         idle_notification: None,
+        idle_inhibit_manager,
         seat: None,
         font_size: args.font_size,
         hold: args.hold,

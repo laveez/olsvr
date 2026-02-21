@@ -1,0 +1,12 @@
+[Unit]
+Description=OLED Screensaver
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/olsvr
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

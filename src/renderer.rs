@@ -20,6 +20,7 @@ pub struct Renderer {
     swash_cache: SwashCache,
     text_atlas: TextAtlas,
     text_renderer: TextRenderer,
+    #[allow(dead_code)] // Owned by glyphon rendering pipeline
     cache: Cache,
     viewport: Viewport,
     time_buffer: Buffer,
@@ -275,11 +276,4 @@ impl Renderer {
         self.font_size * 1.2 + self.font_size * 0.3 * 1.2
     }
 
-    pub fn width(&self) -> u32 {
-        self.config.width
-    }
-
-    pub fn height(&self) -> u32 {
-        self.config.height
-    }
 }

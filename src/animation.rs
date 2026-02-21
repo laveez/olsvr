@@ -71,11 +71,6 @@ impl Animation {
         (self.x, self.y)
     }
 
-    /// Returns true if a new frame is needed (during fade phases).
-    pub fn needs_frame(&self) -> bool {
-        matches!(self.phase, Phase::FadeIn | Phase::FadeOut)
-    }
-
     pub fn tick(&mut self) {
         let elapsed = self.phase_start.elapsed();
         match self.phase {

@@ -63,6 +63,7 @@ struct Args {
 }
 
 struct Screensaver {
+    #[allow(dead_code)] // Kept alive to maintain the Wayland surface
     window: Window,
     renderer: Option<Renderer>,
     animation: Option<Animation>,
@@ -611,15 +612,21 @@ fn main() {
         .insert(event_loop.handle())
         .expect("Failed to insert Wayland source");
 
-    // Register SIGUSR1 handler to activate screensaver on demand
-    let signals = Signals::new(&[Signal::SIGUSR1]).expect("Failed to create signal source");
+    // Register signal handlers
+    let signals = Signals::new(&[Signal::SIGUSR1, Signal::SIGTERM, Signal::SIGINT])
+        .expect("Failed to create signal source");
     event_loop
         .handle()
-        .insert_source(signals, |_, _, app| {
-            log::info!("Received SIGUSR1 — activating screensaver");
-            // We can't call activate() here because we don't have qh.
-            // Instead, set a flag and handle it in the main loop.
-            app.signal_activate = true;
+        .insert_source(signals, |event, _, app| match event.signal() {
+            Signal::SIGUSR1 => {
+                log::info!("Received SIGUSR1 — activating screensaver");
+                app.signal_activate = true;
+            }
+            Signal::SIGTERM | Signal::SIGINT => {
+                log::info!("Received shutdown signal");
+                app.running = false;
+            }
+            _ => {}
         })
         .expect("Failed to insert signal source");
 

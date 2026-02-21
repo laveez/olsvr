@@ -1,3 +1,4 @@
+mod animation;
 mod renderer;
 
 use std::num::NonZeroU32;
@@ -25,6 +26,7 @@ use wayland_client::{
     Connection, QueueHandle,
 };
 
+use crate::animation::Animation;
 use crate::renderer::Renderer;
 
 #[derive(Parser)]
@@ -56,7 +58,9 @@ struct App {
     xdg_shell: XdgShell,
     window: Window,
     renderer: Option<Renderer>,
+    animation: Option<Animation>,
     font_size: u32,
+    hold: u32,
     width: u32,
     height: u32,
     configured: bool,
@@ -65,11 +69,13 @@ struct App {
 
 impl App {
     fn draw(&mut self) {
-        if let Some(ref mut renderer) = self.renderer {
-            // Center the clock for now (animation will change this later)
-            let x = (renderer.width() as f32 - renderer.text_block_width()) / 2.0;
-            let y = (renderer.height() as f32 - renderer.text_block_height()) / 2.0;
-            renderer.render_frame(x, y, 255);
+        if let Some(ref mut anim) = self.animation {
+            anim.tick();
+            let (x, y) = anim.position();
+            let alpha = anim.alpha();
+            if let Some(ref mut renderer) = self.renderer {
+                renderer.render_frame(x, y, alpha);
+            }
         }
     }
 }
@@ -243,13 +249,22 @@ impl WindowHandler for App {
         self.height = h;
 
         if self.renderer.is_none() && w > 0 && h > 0 {
-            self.renderer = Some(Renderer::new(
+            let renderer = Renderer::new(
                 &self.conn,
                 self.window.wl_surface(),
                 w,
                 h,
                 self.font_size,
-            ));
+            );
+            let animation = Animation::new(
+                w as f32,
+                h as f32,
+                renderer.text_block_width(),
+                renderer.text_block_height(),
+                self.hold,
+            );
+            self.renderer = Some(renderer);
+            self.animation = Some(animation);
             self.configured = true;
 
             self.draw();
@@ -258,6 +273,14 @@ impl WindowHandler for App {
             wl_surface.commit();
         } else if let Some(ref mut renderer) = self.renderer {
             renderer.resize(w, h);
+            if let Some(ref mut anim) = self.animation {
+                anim.update_screen_size(
+                    w as f32,
+                    h as f32,
+                    renderer.text_block_width(),
+                    renderer.text_block_height(),
+                );
+            }
         }
     }
 }
@@ -305,7 +328,9 @@ fn main() {
         xdg_shell,
         window,
         renderer: None,
+        animation: None,
         font_size: args.font_size,
+        hold: args.hold,
         width: 0,
         height: 0,
         configured: false,

@@ -23,7 +23,11 @@ use smithay_client_toolkit::{
 use wayland_client::{
     globals::registry_queue_init,
     protocol::{wl_output, wl_seat, wl_surface},
-    Connection, QueueHandle,
+    Connection, Dispatch, QueueHandle,
+};
+use wayland_protocols::ext::idle_notify::v1::client::{
+    ext_idle_notification_v1::{self, ExtIdleNotificationV1},
+    ext_idle_notifier_v1::{self, ExtIdleNotifierV1},
 };
 
 use crate::animation::Animation;
@@ -49,6 +53,12 @@ struct Args {
     hold: u32,
 }
 
+struct Screensaver {
+    window: Window,
+    renderer: Option<Renderer>,
+    animation: Option<Animation>,
+}
+
 struct App {
     conn: Connection,
     registry_state: RegistryState,
@@ -56,24 +66,56 @@ struct App {
     output_state: OutputState,
     seat_state: SeatState,
     xdg_shell: XdgShell,
-    window: Window,
-    renderer: Option<Renderer>,
-    animation: Option<Animation>,
+    screensaver: Option<Screensaver>,
+    idle_notifier: Option<ExtIdleNotifierV1>,
+    idle_notification: Option<ExtIdleNotificationV1>,
+    seat: Option<wl_seat::WlSeat>,
     font_size: u32,
     hold: u32,
     width: u32,
     height: u32,
-    configured: bool,
     running: bool,
 }
 
 impl App {
+    fn activate(&mut self, qh: &QueueHandle<Self>) {
+        if self.screensaver.is_some() {
+            return;
+        }
+        log::info!("Activating screensaver");
+
+        let surface = self.compositor_state.create_surface(qh);
+        let window = self.xdg_shell.create_window(surface, WindowDecorations::None, qh);
+        window.set_fullscreen(None);
+        window.set_title("olsvr");
+        window.set_app_id("olsvr");
+        window.commit();
+
+        // Renderer/animation are created in configure callback when we know the size
+        self.screensaver = Some(Screensaver {
+            window,
+            renderer: None,
+            animation: None,
+        });
+    }
+
+    fn deactivate(&mut self) {
+        if self.screensaver.is_none() {
+            return;
+        }
+        log::info!("Deactivating screensaver");
+        // Drop destroys the window and its Wayland resources
+        self.screensaver = None;
+    }
+
     fn draw(&mut self) {
-        if let Some(ref mut anim) = self.animation {
-            anim.tick();
-            let (x, y) = anim.position();
-            let alpha = anim.alpha();
-            if let Some(ref mut renderer) = self.renderer {
+        if let Some(ref mut ss) = self.screensaver {
+            if let (Some(anim), Some(renderer)) =
+                (&mut ss.animation, &mut ss.renderer)
+            {
+                anim.tick();
+                let (x, y) = anim.position();
+                let alpha = anim.alpha();
                 renderer.render_frame(x, y, alpha);
             }
         }
@@ -160,7 +202,6 @@ impl OutputHandler for App {
             if let Some(mode) = info.modes.iter().find(|m| m.current) {
                 self.width = mode.dimensions.0 as u32;
                 self.height = mode.dimensions.1 as u32;
-                log::info!("Output updated: {}x{}", self.width, self.height);
             }
         }
     }
@@ -183,8 +224,11 @@ impl SeatHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
+        seat: wl_seat::WlSeat,
     ) {
+        if self.seat.is_none() {
+            self.seat = Some(seat);
+        }
     }
 
     fn new_capability(
@@ -221,14 +265,14 @@ impl WindowHandler for App {
         _qh: &QueueHandle<Self>,
         _window: &Window,
     ) {
-        self.running = false;
+        self.deactivate();
     }
 
     fn configure(
         &mut self,
         _conn: &Connection,
         qh: &QueueHandle<Self>,
-        _window: &Window,
+        window: &Window,
         configure: WindowConfigure,
         _serial: u32,
     ) {
@@ -244,44 +288,83 @@ impl WindowHandler for App {
                 .map(NonZeroU32::get)
                 .unwrap_or(self.height),
         );
-        log::info!("Window configured: {w}x{h}");
-        self.width = w;
-        self.height = h;
 
-        if self.renderer.is_none() && w > 0 && h > 0 {
-            let renderer = Renderer::new(
-                &self.conn,
-                self.window.wl_surface(),
-                w,
-                h,
-                self.font_size,
-            );
-            let animation = Animation::new(
-                w as f32,
-                h as f32,
-                renderer.text_block_width(),
-                renderer.text_block_height(),
-                self.hold,
-            );
-            self.renderer = Some(renderer);
-            self.animation = Some(animation);
-            self.configured = true;
+        if let Some(ref mut ss) = self.screensaver {
+            if w == 0 || h == 0 {
+                return;
+            }
 
-            self.draw();
-            let wl_surface = self.window.wl_surface();
-            wl_surface.frame(qh, wl_surface.clone());
-            wl_surface.commit();
-        } else if let Some(ref mut renderer) = self.renderer {
-            renderer.resize(w, h);
-            if let Some(ref mut anim) = self.animation {
-                anim.update_screen_size(
+            if ss.renderer.is_none() {
+                log::info!("Window configured: {w}x{h}, initializing renderer");
+                let renderer = Renderer::new(
+                    &self.conn,
+                    window.wl_surface(),
+                    w,
+                    h,
+                    self.font_size,
+                );
+                let animation = Animation::new(
                     w as f32,
                     h as f32,
                     renderer.text_block_width(),
                     renderer.text_block_height(),
+                    self.hold,
                 );
+                ss.renderer = Some(renderer);
+                ss.animation = Some(animation);
+
+                self.draw();
+                let wl_surface = window.wl_surface();
+                wl_surface.frame(qh, wl_surface.clone());
+                wl_surface.commit();
+            } else if let Some(ref mut renderer) = ss.renderer {
+                renderer.resize(w, h);
+                if let Some(ref mut anim) = ss.animation {
+                    anim.update_screen_size(
+                        w as f32,
+                        h as f32,
+                        renderer.text_block_width(),
+                        renderer.text_block_height(),
+                    );
+                }
             }
         }
+    }
+}
+
+// Idle notification dispatch
+impl Dispatch<ExtIdleNotificationV1, ()> for App {
+    fn event(
+        state: &mut Self,
+        _notification: &ExtIdleNotificationV1,
+        event: ext_idle_notification_v1::Event,
+        _: &(),
+        _conn: &Connection,
+        qh: &QueueHandle<Self>,
+    ) {
+        match event {
+            ext_idle_notification_v1::Event::Idled => {
+                log::info!("User idle — activating screensaver");
+                state.activate(qh);
+            }
+            ext_idle_notification_v1::Event::Resumed => {
+                log::info!("User resumed — deactivating screensaver");
+                state.deactivate();
+            }
+            _ => {}
+        }
+    }
+}
+
+impl Dispatch<ExtIdleNotifierV1, ()> for App {
+    fn event(
+        _state: &mut Self,
+        _notifier: &ExtIdleNotifierV1,
+        _event: ext_idle_notifier_v1::Event,
+        _: &(),
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+    ) {
     }
 }
 
@@ -312,12 +395,11 @@ fn main() {
         CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
     let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_wm_base not available");
 
-    let surface = compositor_state.create_surface(&qh);
-    let window = xdg_shell.create_window(surface, WindowDecorations::None, &qh);
-    window.set_fullscreen(None);
-    window.set_title("olsvr");
-    window.set_app_id("olsvr");
-    window.commit();
+    // Bind idle notifier (optional — not all compositors support it)
+    let idle_notifier: Option<ExtIdleNotifierV1> = globals.bind(&qh, 1..=1, ()).ok();
+    if idle_notifier.is_none() {
+        log::warn!("ext_idle_notifier_v1 not available — idle detection disabled");
+    }
 
     let mut app = App {
         conn: conn.clone(),
@@ -326,14 +408,14 @@ fn main() {
         output_state: OutputState::new(&globals, &qh),
         seat_state: SeatState::new(&globals, &qh),
         xdg_shell,
-        window,
-        renderer: None,
-        animation: None,
+        screensaver: None,
+        idle_notifier,
+        idle_notification: None,
+        seat: None,
         font_size: args.font_size,
         hold: args.hold,
         width: 0,
         height: 0,
-        configured: false,
         running: true,
     };
 
@@ -343,6 +425,22 @@ fn main() {
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())
         .expect("Failed to insert Wayland source");
+
+    // Do initial roundtrip to get seat
+    event_loop
+        .dispatch(std::time::Duration::from_millis(100), &mut app)
+        .expect("Initial dispatch failed");
+
+    if args.activate {
+        // Immediate activation mode
+        app.activate(&qh);
+    } else if let (Some(notifier), Some(seat)) = (&app.idle_notifier, &app.seat) {
+        // Set up idle notification
+        let timeout_ms = args.timeout * 60 * 1000;
+        log::info!("Setting up idle notification: {}ms", timeout_ms);
+        let notification = notifier.get_idle_notification(timeout_ms, seat, &qh, ());
+        app.idle_notification = Some(notification);
+    }
 
     while app.running {
         event_loop

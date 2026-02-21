@@ -56,6 +56,7 @@ struct App {
     xdg_shell: XdgShell,
     window: Window,
     renderer: Option<Renderer>,
+    font_size: u32,
     width: u32,
     height: u32,
     configured: bool,
@@ -64,8 +65,11 @@ struct App {
 
 impl App {
     fn draw(&mut self) {
-        if let Some(ref renderer) = self.renderer {
-            renderer.render_frame();
+        if let Some(ref mut renderer) = self.renderer {
+            // Center the clock for now (animation will change this later)
+            let x = (renderer.width() as f32 - renderer.text_block_width()) / 2.0;
+            let y = (renderer.height() as f32 - renderer.text_block_height()) / 2.0;
+            renderer.render_frame(x, y, 255);
         }
     }
 }
@@ -223,8 +227,16 @@ impl WindowHandler for App {
         _serial: u32,
     ) {
         let (w, h) = (
-            configure.new_size.0.map(NonZeroU32::get).unwrap_or(self.width),
-            configure.new_size.1.map(NonZeroU32::get).unwrap_or(self.height),
+            configure
+                .new_size
+                .0
+                .map(NonZeroU32::get)
+                .unwrap_or(self.width),
+            configure
+                .new_size
+                .1
+                .map(NonZeroU32::get)
+                .unwrap_or(self.height),
         );
         log::info!("Window configured: {w}x{h}");
         self.width = w;
@@ -236,10 +248,10 @@ impl WindowHandler for App {
                 self.window.wl_surface(),
                 w,
                 h,
+                self.font_size,
             ));
             self.configured = true;
 
-            // Kick off first frame
             self.draw();
             let wl_surface = self.window.wl_surface();
             wl_surface.frame(qh, wl_surface.clone());
@@ -267,7 +279,7 @@ delegate_xdg_window!(App);
 
 fn main() {
     env_logger::init();
-    let _args = Args::parse();
+    let args = Args::parse();
 
     let conn = Connection::connect_to_env().expect("Failed to connect to Wayland");
     let (globals, event_queue) = registry_queue_init(&conn).expect("Failed to init registry");
@@ -293,6 +305,7 @@ fn main() {
         xdg_shell,
         window,
         renderer: None,
+        font_size: args.font_size,
         width: 0,
         height: 0,
         configured: false,

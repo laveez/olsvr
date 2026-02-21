@@ -1,0 +1,18 @@
+[package]
+name = "olsvr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+wgpu = "28"
+glyphon = "0.10"
+calloop = "0.14"
+clap = { version = "4", features = ["derive"] }
+chrono = "0.4"
+rand = "0.9"
+raw-window-handle = "0.6"
+log = "0.4"
+env_logger = "0.11"

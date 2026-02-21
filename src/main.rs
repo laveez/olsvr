@@ -6,14 +6,18 @@ use std::num::NonZeroU32;
 use clap::Parser;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_output, delegate_registry, delegate_seat, delegate_xdg_shell,
-    delegate_xdg_window,
+    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
+    delegate_seat, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
     reexports::calloop::EventLoop,
     reexports::calloop_wayland_source::WaylandSource,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
-    seat::{Capability, SeatHandler, SeatState},
+    seat::{
+        Capability, SeatHandler, SeatState,
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
+        pointer::{PointerEvent, PointerHandler},
+    },
     shell::WaylandSurface,
     shell::xdg::{
         window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
@@ -22,7 +26,7 @@ use smithay_client_toolkit::{
 };
 use wayland_client::{
     globals::registry_queue_init,
-    protocol::{wl_output, wl_seat, wl_surface},
+    protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
     Connection, Dispatch, QueueHandle,
 };
 use wayland_protocols::ext::idle_notify::v1::client::{
@@ -76,6 +80,8 @@ struct App {
     idle_notification: Option<ExtIdleNotificationV1>,
     idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
     seat: Option<wl_seat::WlSeat>,
+    keyboard: Option<wl_keyboard::WlKeyboard>,
+    pointer: Option<wl_pointer::WlPointer>,
     font_size: u32,
     hold: u32,
     width: u32,
@@ -248,10 +254,24 @@ impl SeatHandler for App {
     fn new_capability(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
-        _capability: Capability,
+        qh: &QueueHandle<Self>,
+        seat: wl_seat::WlSeat,
+        capability: Capability,
     ) {
+        if capability == Capability::Keyboard && self.keyboard.is_none() {
+            let keyboard = self
+                .seat_state
+                .get_keyboard(qh, &seat, None)
+                .expect("Failed to create keyboard");
+            self.keyboard = Some(keyboard);
+        }
+        if capability == Capability::Pointer && self.pointer.is_none() {
+            let pointer = self
+                .seat_state
+                .get_pointer(qh, &seat)
+                .expect("Failed to create pointer");
+            self.pointer = Some(pointer);
+        }
     }
 
     fn remove_capability(
@@ -259,8 +279,18 @@ impl SeatHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _seat: wl_seat::WlSeat,
-        _capability: Capability,
+        capability: Capability,
     ) {
+        if capability == Capability::Keyboard {
+            if let Some(kb) = self.keyboard.take() {
+                kb.release();
+            }
+        }
+        if capability == Capability::Pointer {
+            if let Some(ptr) = self.pointer.take() {
+                ptr.release();
+            }
+        }
     }
 
     fn remove_seat(
@@ -346,6 +376,85 @@ impl WindowHandler for App {
     }
 }
 
+impl KeyboardHandler for App {
+    fn enter(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+        _raw: &[u32],
+        _keysyms: &[Keysym],
+    ) {
+    }
+
+    fn leave(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _surface: &wl_surface::WlSurface,
+        _serial: u32,
+    ) {
+    }
+
+    fn press_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _event: KeyEvent,
+    ) {
+        self.deactivate();
+    }
+
+    fn repeat_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _event: KeyEvent,
+    ) {
+    }
+
+    fn release_key(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _event: KeyEvent,
+    ) {
+    }
+
+    fn update_modifiers(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _keyboard: &wl_keyboard::WlKeyboard,
+        _serial: u32,
+        _modifiers: Modifiers,
+        _raw_modifiers: RawModifiers,
+        _layout: u32,
+    ) {
+    }
+}
+
+impl PointerHandler for App {
+    fn pointer_frame(
+        &mut self,
+        _conn: &Connection,
+        _qh: &QueueHandle<Self>,
+        _pointer: &wl_pointer::WlPointer,
+        _events: &[PointerEvent],
+    ) {
+        self.deactivate();
+    }
+}
+
 // Idle notification dispatch
 impl Dispatch<ExtIdleNotificationV1, ()> for App {
     fn event(
@@ -415,7 +524,9 @@ impl ProvidesRegistryState for App {
 }
 
 delegate_compositor!(App);
+delegate_keyboard!(App);
 delegate_output!(App);
+delegate_pointer!(App);
 delegate_registry!(App);
 delegate_seat!(App);
 delegate_xdg_shell!(App);
@@ -458,6 +569,8 @@ fn main() {
         idle_notification: None,
         idle_inhibit_manager,
         seat: None,
+        keyboard: None,
+        pointer: None,
         font_size: args.font_size,
         hold: args.hold,
         width: 0,

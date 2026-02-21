@@ -2,6 +2,7 @@ mod animation;
 mod renderer;
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 
 use clap::Parser;
 use smithay_client_toolkit::{
@@ -9,7 +10,7 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
-    reexports::calloop::EventLoop,
+    reexports::calloop::{signals::{Signal, Signals}, EventLoop},
     reexports::calloop_wayland_source::WaylandSource,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -87,6 +88,7 @@ struct App {
     width: u32,
     height: u32,
     running: bool,
+    signal_activate: bool,
 }
 
 impl App {
@@ -532,9 +534,32 @@ delegate_seat!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 
+fn pid_path() -> PathBuf {
+    let uid = unsafe { libc::getuid() };
+    PathBuf::from(format!("/run/user/{uid}/olsvr.pid"))
+}
+
 fn main() {
     env_logger::init();
     let args = Args::parse();
+
+    // --activate: send SIGUSR1 to running instance and exit
+    if args.activate {
+        let path = pid_path();
+        if let Ok(contents) = std::fs::read_to_string(&path) {
+            if let Ok(pid) = contents.trim().parse::<i32>() {
+                log::info!("Sending SIGUSR1 to PID {pid}");
+                unsafe { libc::kill(pid, libc::SIGUSR1) };
+                return;
+            }
+        }
+        eprintln!("No running olsvr instance found (no PID file at {})", path.display());
+        std::process::exit(1);
+    }
+
+    // Write PID file
+    let path = pid_path();
+    std::fs::write(&path, std::process::id().to_string()).expect("Failed to write PID file");
 
     let conn = Connection::connect_to_env().expect("Failed to connect to Wayland");
     let (globals, event_queue) = registry_queue_init(&conn).expect("Failed to init registry");
@@ -576,6 +601,7 @@ fn main() {
         width: 0,
         height: 0,
         running: true,
+        signal_activate: false,
     };
 
     let mut event_loop: EventLoop<App> =
@@ -585,15 +611,24 @@ fn main() {
         .insert(event_loop.handle())
         .expect("Failed to insert Wayland source");
 
+    // Register SIGUSR1 handler to activate screensaver on demand
+    let signals = Signals::new(&[Signal::SIGUSR1]).expect("Failed to create signal source");
+    event_loop
+        .handle()
+        .insert_source(signals, |_, _, app| {
+            log::info!("Received SIGUSR1 — activating screensaver");
+            // We can't call activate() here because we don't have qh.
+            // Instead, set a flag and handle it in the main loop.
+            app.signal_activate = true;
+        })
+        .expect("Failed to insert signal source");
+
     // Do initial roundtrip to get seat
     event_loop
         .dispatch(std::time::Duration::from_millis(100), &mut app)
         .expect("Initial dispatch failed");
 
-    if args.activate {
-        // Immediate activation mode
-        app.activate(&qh);
-    } else if let (Some(notifier), Some(seat)) = (&app.idle_notifier, &app.seat) {
+    if let (Some(notifier), Some(seat)) = (&app.idle_notifier, &app.seat) {
         // Set up idle notification
         let timeout_ms = args.timeout * 60 * 1000;
         log::info!("Setting up idle notification: {}ms", timeout_ms);
@@ -605,5 +640,13 @@ fn main() {
         event_loop
             .dispatch(std::time::Duration::from_millis(16), &mut app)
             .expect("Event loop dispatch failed");
+
+        if app.signal_activate {
+            app.signal_activate = false;
+            app.activate(&qh);
+        }
     }
+
+    // Clean up PID file
+    let _ = std::fs::remove_file(pid_path());
 }

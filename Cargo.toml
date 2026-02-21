@@ -10,7 +10,8 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wgpu = "28"
 glyphon = "0.10"
-calloop = "0.14"
+calloop = { version = "0.14", features = ["signals"] }
+libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
 rand = "0.9"

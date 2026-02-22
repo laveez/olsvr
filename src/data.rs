@@ -141,7 +141,9 @@ pub fn start_fetch_thread(
         loop {
             match fetch_fmi_weather(&location) {
                 Ok((temp, symbol, wind)) => {
-                    log::info!("Weather: {temp:.1}°C, symbol={symbol}, wind={wind:.1}m/s ({display_name})");
+                    log::info!(
+                        "Weather: {temp:.1}°C, symbol={symbol}, wind={wind:.1}m/s ({display_name})"
+                    );
                     if let Ok(mut c) = cache.write() {
                         c.weather = Some(WeatherData {
                             temperature: temp,

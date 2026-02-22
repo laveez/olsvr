@@ -48,6 +48,8 @@ pub fn run() {
     loop {
         prompt_timing(&theme, &mut config);
         prompt_display(&theme, &mut config);
+        prompt_weather(&theme, &mut config);
+        rebuild_layers(&mut config);
 
         if let Err(e) = config.save() {
             eprintln!("Failed to save config: {e}");
@@ -84,6 +86,7 @@ pub fn run() {
                 "Yes, continue",
                 "Change timing",
                 "Change display",
+                "Change weather",
                 "Start over",
             ])
             .default(0)
@@ -92,17 +95,26 @@ pub fn run() {
 
         match choice {
             0 => break,
-            1 => continue, // loop will re-prompt timing then display
+            1 => continue,
             2 => {
                 prompt_display(&theme, &mut config);
+                rebuild_layers(&mut config);
                 if let Err(e) = config.save() {
                     eprintln!("Failed to save config: {e}");
                     return;
                 }
-                // Re-check satisfaction
                 continue;
             }
             3 => {
+                prompt_weather(&theme, &mut config);
+                rebuild_layers(&mut config);
+                if let Err(e) = config.save() {
+                    eprintln!("Failed to save config: {e}");
+                    return;
+                }
+                continue;
+            }
+            4 => {
                 config = Config::default();
                 continue;
             }
@@ -204,6 +216,201 @@ fn prompt_display(theme: &ColorfulTheme, config: &mut Config) {
         .default(config.edge_padding)
         .interact_text()
         .unwrap();
+}
+
+fn prompt_weather(theme: &ColorfulTheme, config: &mut Config) {
+    println!();
+    println!("  -- Weather --");
+    println!();
+
+    // Detect current weather config from layers
+    let existing = config.layers.as_ref().and_then(|layers| {
+        layers
+            .iter()
+            .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("weather"))
+            .cloned()
+    });
+    let has_weather = existing.is_some();
+
+    let enable_idx = Select::with_theme(theme)
+        .with_prompt("Show weather overlay?")
+        .items(["Yes", "No"])
+        .default(if has_weather { 0 } else { 1 })
+        .interact()
+        .unwrap();
+
+    if enable_idx == 1 {
+        // Remove weather layer if present
+        if let Some(ref mut layers) = config.layers {
+            layers.retain(|t| t.get("type").and_then(|v| v.as_str()) != Some("weather"));
+        }
+        return;
+    }
+
+    let default_location = existing
+        .as_ref()
+        .and_then(|t| t.get("location").and_then(|v| v.as_str()))
+        .unwrap_or("helsinki");
+    let location: String = Input::with_theme(theme)
+        .with_prompt("Weather location")
+        .default(default_location.into())
+        .interact_text()
+        .unwrap();
+
+    let default_interval = existing
+        .as_ref()
+        .and_then(|t| t.get("update_interval").and_then(|v| v.as_integer()))
+        .unwrap_or(600) as u32;
+    let interval: u32 = Input::with_theme(theme)
+        .with_prompt("Update interval (seconds)")
+        .default(default_interval)
+        .interact_text()
+        .unwrap();
+
+    let default_font_size = existing
+        .as_ref()
+        .and_then(|t| t.get("font_size").and_then(|v| v.as_integer()))
+        .unwrap_or(28) as u32;
+    let font_size: u32 = Input::with_theme(theme)
+        .with_prompt("Weather font size")
+        .default(default_font_size)
+        .interact_text()
+        .unwrap();
+
+    let default_icon_font = existing
+        .as_ref()
+        .and_then(|t| t.get("icon_font").and_then(|v| v.as_str()))
+        .unwrap_or("MesloLGS NF");
+    let icon_font: String = Input::with_theme(theme)
+        .with_prompt("Icon font (Nerd Font with weather glyphs)")
+        .default(default_icon_font.into())
+        .interact_text()
+        .unwrap();
+
+    // Build weather layer table
+    let mut weather = toml::value::Table::new();
+    weather.insert("type".into(), toml::Value::String("weather".into()));
+    weather.insert("location".into(), toml::Value::String(location));
+    weather.insert(
+        "update_interval".into(),
+        toml::Value::Integer(interval as i64),
+    );
+    weather.insert("font_size".into(), toml::Value::Integer(font_size as i64));
+    weather.insert("icon_font".into(), toml::Value::String(icon_font));
+
+    // Replace or add weather layer
+    let layers = config.layers.get_or_insert_with(Vec::new);
+    if let Some(existing) = layers
+        .iter_mut()
+        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("weather"))
+    {
+        *existing = weather;
+    } else {
+        layers.push(weather);
+    }
+}
+
+/// Rebuild config.layers to ensure a clock layer exists alongside weather.
+fn rebuild_layers(config: &mut Config) {
+    let has_weather = config.layers.as_ref().is_some_and(|l| {
+        l.iter()
+            .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("weather"))
+    });
+
+    if !has_weather {
+        // No weather — drop layers so flat config is used for the single clock
+        config.layers = None;
+        return;
+    }
+
+    // Weather enabled — ensure clock layer exists in the layers array
+    let layers = config.layers.get_or_insert_with(Vec::new);
+    let has_clock = layers
+        .iter()
+        .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("clock"));
+
+    if !has_clock {
+        // Build clock layer from flat config fields
+        let mut clock = toml::value::Table::new();
+        clock.insert("type".into(), toml::Value::String("clock".into()));
+        clock.insert(
+            "font_size".into(),
+            toml::Value::Integer(config.font_size as i64),
+        );
+        clock.insert(
+            "font_family".into(),
+            toml::Value::String(config.font_family.clone()),
+        );
+        clock.insert(
+            "time_format".into(),
+            toml::Value::String(config.time_format.clone()),
+        );
+        clock.insert(
+            "date_format".into(),
+            toml::Value::String(config.date_format.clone()),
+        );
+        clock.insert(
+            "color".into(),
+            toml::Value::Array(
+                config
+                    .color
+                    .iter()
+                    .map(|&c| toml::Value::Integer(c as i64))
+                    .collect(),
+            ),
+        );
+        clock.insert("hold".into(), toml::Value::Integer(config.hold as i64));
+        clock.insert(
+            "fade_duration".into(),
+            toml::Value::Integer(config.fade_duration as i64),
+        );
+        clock.insert(
+            "edge_padding".into(),
+            toml::Value::Integer(config.edge_padding as i64),
+        );
+        layers.insert(0, clock);
+    } else {
+        // Update existing clock layer from flat config fields
+        let clock = layers
+            .iter_mut()
+            .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("clock"))
+            .unwrap();
+        clock.insert(
+            "font_size".into(),
+            toml::Value::Integer(config.font_size as i64),
+        );
+        clock.insert(
+            "font_family".into(),
+            toml::Value::String(config.font_family.clone()),
+        );
+        clock.insert(
+            "time_format".into(),
+            toml::Value::String(config.time_format.clone()),
+        );
+        clock.insert(
+            "date_format".into(),
+            toml::Value::String(config.date_format.clone()),
+        );
+        clock.insert(
+            "color".into(),
+            toml::Value::Array(
+                config
+                    .color
+                    .iter()
+                    .map(|&c| toml::Value::Integer(c as i64))
+                    .collect(),
+            ),
+        );
+        clock.insert("hold".into(), toml::Value::Integer(config.hold as i64));
+        clock.insert(
+            "fade_duration".into(),
+            toml::Value::Integer(config.fade_duration as i64),
+        );
+        clock.insert(
+            "edge_padding".into(),
+            toml::Value::Integer(config.edge_padding as i64),
+        );
+    }
 }
 
 fn install_systemd_service() {

@@ -28,6 +28,7 @@ olsvr prevents OLED burn-in by displaying a fading clock that periodically repos
 - **Idle detection** — activates via `ext-idle-notify-v1` or D-Bus (GNOME) after configurable timeout
 - **Fade animation** — clock fades in, holds, fades out, then teleports to a new position
 - **Quadrant-aware repositioning** — never lands in the same screen quadrant twice in a row
+- **Weather overlay** — colored Nerd Font weather icons with temperature and wind speed via FMI open data
 - **GPU-accelerated** — wgpu + glyphon text rendering on Vulkan
 - **Configurable** — font, size, color, timing, date/time format via `~/.olsvr.toml`
 - **Interactive setup wizard** — `olsvr setup` walks through configuration with live preview
@@ -69,8 +70,9 @@ Running `olsvr setup` (or just `olsvr` on first run) starts an interactive wizar
 
 1. **Timing** — idle timeout, hold duration, fade speed
 2. **Display** — font size, family, time/date format, brightness, padding
-3. **Preview** — launch a live preview to see your settings
-4. **systemd** — optionally install as a user service that starts on login
+3. **Weather** — enable/disable weather overlay, location, icon font
+4. **Preview** — launch a live preview to see your settings
+5. **systemd** — optionally install as a user service that starts on login
 
 The wizard writes `~/.olsvr.toml` and can be re-run at any time to adjust settings.
 
@@ -78,7 +80,9 @@ The wizard writes `~/.olsvr.toml` and can be re-run at any time to adjust settin
 
 ## Configuration
 
-Settings live in `~/.olsvr.toml`. All fields are optional — defaults are used for anything omitted.
+Settings live in `~/.olsvr.toml`. All fields are optional — defaults are used for anything omitted. The setup wizard (`olsvr setup`) is the easiest way to configure everything.
+
+### Clock settings
 
 | Field | Description | Default |
 |---|---|---|
@@ -91,6 +95,41 @@ Settings live in `~/.olsvr.toml`. All fields are optional — defaults are used 
 | `date_format` | [chrono format string](https://docs.rs/chrono/latest/chrono/format/strftime/) | `%a %d %b` |
 | `color` | RGB brightness `[r, g, b]` | `[255, 255, 255]` |
 | `edge_padding` | Minimum distance from screen edges (pixels) | `50` |
+
+### Weather layer
+
+The weather overlay displays a colored icon, temperature, and wind speed below the clock using [FMI Open Data](https://en.ilmatieteenlaitos.fi/open-data). Icons use Nerd Font weather glyphs — install a [Nerd Font](https://www.nerdfonts.com/) with weather icons (e.g. MesloLGS NF).
+
+| Field | Description | Default |
+|---|---|---|
+| `location` | City name for FMI weather data | `helsinki` |
+| `update_interval` | Weather fetch interval (seconds) | `600` |
+| `font_size` | Weather text size (pixels) | `28` |
+| `icon_font` | Nerd Font family for weather icons | `MesloLGS NF` |
+
+### Example config
+
+```toml
+timeout = 5
+
+[[layers]]
+type = "clock"
+font_size = 200
+font_family = "sans-serif"
+time_format = "24h"
+date_format = "%a %d %b"
+color = [200, 200, 200]
+hold = 10
+fade_duration = 1500
+edge_padding = 50
+
+[[layers]]
+type = "weather"
+location = "helsinki"
+update_interval = 600
+font_size = 28
+icon_font = "MesloLGS NF"
+```
 
 CLI flags override config file values:
 
@@ -131,6 +170,7 @@ The screensaver creates a fullscreen Wayland window with a pure black background
 - **Rust toolchain** for building from source
 - **GPU** with Vulkan support (wgpu backend)
 - **libdbus** (for GNOME D-Bus fallback) — `libdbus-1-dev` on Debian/Ubuntu, `dbus-devel` on Fedora
+- **Nerd Font** (optional, for weather icons) — install from [nerdfonts.com](https://www.nerdfonts.com/)
 
 > Idle detection uses `ext-idle-notify-v1` (Sway, Hyprland) with automatic D-Bus fallback for GNOME/Mutter. Manual trigger is also available: `olsvr run --activate`
 

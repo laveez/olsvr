@@ -8,28 +8,24 @@ use glyphon::{
 use crate::data::DataCache;
 use crate::layer::{GpuContext, Layer};
 
-fn weather_symbol_text(code: u8) -> &'static str {
+/// Returns (nerd font icon char, RGB color) for an FMI WeatherSymbol3 code.
+fn weather_icon(code: u8) -> (char, [u8; 3]) {
     match code {
-        1 => "Clear",
-        2 => "Partly cloudy",
-        3 => "Cloudy",
-        21 => "Light rain",
-        22 => "Rain",
-        23 => "Heavy rain",
-        31 => "Light snow",
-        32 => "Snow",
-        33 => "Heavy snow",
-        41 => "Light sleet",
-        42 => "Sleet",
-        43 => "Heavy sleet",
-        51 => "Light rain",
-        52 => "Rain",
-        53 => "Heavy rain",
-        61 => "Thunder",
-        62 => "Heavy thunder",
-        63 => "Thunder",
-        64 => "Thunder + snow",
-        _ => "",
+        1 => ('\u{E30D}', [0xFF, 0xD7, 0x00]),  // day_sunny — yellow
+        2 => ('\u{E302}', [0x87, 0xCE, 0xEB]),  // day_cloudy — light blue
+        3 => ('\u{E312}', [0xA0, 0xA0, 0xA0]),  // cloudy — gray
+        21 => ('\u{E319}', [0x6C, 0xB4, 0xEE]), // showers — light blue
+        22 => ('\u{E318}', [0x4A, 0x90, 0xD9]), // rain — blue
+        23 => ('\u{E318}', [0x2E, 0x5C, 0xA8]), // heavy rain — deep blue
+        31 => ('\u{E31A}', [0xE0, 0xE0, 0xE0]), // light snow — white
+        32 => ('\u{E31A}', [0xFF, 0xFF, 0xFF]), // snow — white
+        33 => ('\u{E35E}', [0xFF, 0xFF, 0xFF]), // snow_wind — bright white
+        41 => ('\u{E3AD}', [0x5F, 0x9E, 0xA0]), // light sleet — teal
+        42 => ('\u{E3AD}', [0x5F, 0x9E, 0xA0]), // sleet — teal
+        43 => ('\u{E3AD}', [0x4A, 0x8A, 0x8C]), // heavy sleet — dark teal
+        51..=53 => ('\u{E309}', [0x4A, 0x90, 0xD9]), // showers — blue
+        61..=64 => ('\u{E31D}', [0x93, 0x70, 0xDB]), // thunderstorm — purple
+        _ => ('\u{E33D}', [0x80, 0x80, 0x80]),  // cloud — gray
     }
 }
 
@@ -38,7 +34,7 @@ pub struct WeatherLayer {
     buffer: Option<Buffer>,
     data_cache: Option<Arc<RwLock<DataCache>>>,
     font_size: f32,
-    text_color: [u8; 3],
+    icon_font: String,
     // Cached from clock position each frame
     x: f32,
     y: f32,
@@ -53,7 +49,7 @@ impl Default for WeatherLayer {
             buffer: None,
             data_cache: None,
             font_size: 24.0,
-            text_color: [150, 150, 150],
+            icon_font: "MesloLGS NF".into(),
             x: 0.0,
             y: 0.0,
             current_alpha: 0,
@@ -78,15 +74,8 @@ impl Layer for WeatherLayer {
         if let Some(v) = config.get("font_size").and_then(|v| v.as_integer()) {
             self.font_size = v as f32;
         }
-        if let Some(arr) = config.get("color").and_then(|v| v.as_array())
-            && arr.len() == 3
-            && let (Some(r), Some(g), Some(b)) = (
-                arr[0].as_integer(),
-                arr[1].as_integer(),
-                arr[2].as_integer(),
-            )
-        {
-            self.text_color = [r as u8, g as u8, b as u8];
+        if let Some(v) = config.get("icon_font").and_then(|v| v.as_str()) {
+            self.icon_font = v.to_string();
         }
 
         self.screen_w = ctx.width;
@@ -95,17 +84,14 @@ impl Layer for WeatherLayer {
 
         let fs = self.font_size;
         let mut buffer = Buffer::new(font_system, Metrics::new(fs, fs * 1.4));
-        buffer.set_size(font_system, Some(fs * 12.0), Some(fs * 2.0));
-        buffer.set_text(
+        buffer.set_size(font_system, Some(fs * 14.0), Some(fs * 2.0));
+        buffer.set_rich_text(
             font_system,
-            "",
-            &Attrs::new().family(Family::SansSerif),
+            [("", Attrs::new().family(Family::SansSerif))],
+            &Attrs::new(),
             Shaping::Advanced,
-            None,
+            Some(Align::Center),
         );
-        for line in buffer.lines.iter_mut() {
-            line.set_align(Some(Align::Center));
-        }
         buffer.shape_until_scroll(font_system, false);
         self.buffer = Some(buffer);
     }
@@ -118,7 +104,7 @@ impl Layer for WeatherLayer {
         {
             // Center weather text below the clock block, offset by a small gap
             let gap = self.font_size * 0.5;
-            self.x = pos.x + (pos.block_width - self.font_size * 12.0) / 2.0;
+            self.x = pos.x + (pos.block_width - self.font_size * 14.0) / 2.0;
             self.y = pos.y + pos.block_height + gap;
             self.current_alpha = pos.alpha;
         }
@@ -136,30 +122,48 @@ impl Layer for WeatherLayer {
             return;
         };
 
-        let text = if let Ok(cache) = cache.read()
+        let a = self.current_alpha;
+        let (icon_str, temp_str, wind_str);
+
+        let spans: Vec<(&str, Attrs<'_>)> = if let Ok(cache) = cache.read()
             && let Some(ref weather) = cache.weather
         {
-            let symbol = weather_symbol_text(weather.weather_symbol);
-            let wind = format!("{:.0} m/s", weather.wind_speed);
-            if symbol.is_empty() {
-                format!("{:.0}°C  {}", weather.temperature, wind)
-            } else {
-                format!("{:.0}°C  {}  {}", weather.temperature, symbol, wind)
-            }
+            let (icon_char, [ir, ig, ib]) = weather_icon(weather.weather_symbol);
+            icon_str = icon_char.to_string();
+            temp_str = format!("  {:.0}°C  ", weather.temperature);
+            wind_str = format!("{:.0} m/s", weather.wind_speed);
+
+            vec![
+                (
+                    &icon_str,
+                    Attrs::new()
+                        .family(Family::Name(&self.icon_font))
+                        .color(Color::rgba(ir, ig, ib, a)),
+                ),
+                (
+                    &temp_str,
+                    Attrs::new()
+                        .family(Family::SansSerif)
+                        .color(Color::rgba(0xE0, 0xE0, 0xE0, a)),
+                ),
+                (
+                    &wind_str,
+                    Attrs::new()
+                        .family(Family::SansSerif)
+                        .color(Color::rgba(0xA0, 0xA0, 0xA0, a)),
+                ),
+            ]
         } else {
-            String::new()
+            vec![]
         };
 
-        buffer.set_text(
+        buffer.set_rich_text(
             font_system,
-            &text,
-            &Attrs::new().family(Family::SansSerif),
+            spans,
+            &Attrs::new(),
             Shaping::Advanced,
-            None,
+            Some(Align::Center),
         );
-        for line in buffer.lines.iter_mut() {
-            line.set_align(Some(Align::Center));
-        }
         buffer.shape_until_scroll(font_system, false);
     }
 
@@ -170,8 +174,7 @@ impl Layer for WeatherLayer {
         let Some(ref buf) = self.buffer else {
             return vec![];
         };
-        let [r, g, b] = self.text_color;
-        let color = Color::rgba(r, g, b, self.current_alpha);
+        let color = Color::rgba(0xA0, 0xA0, 0xA0, self.current_alpha);
 
         vec![TextArea {
             buffer: buf,

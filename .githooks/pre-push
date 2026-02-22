@@ -1,0 +1,16 @@
+#!/bin/sh
+set -e
+
+echo "Running pre-push checks..."
+
+cargo fmt -- --check || {
+    echo "ERROR: cargo fmt failed. Run 'cargo fmt' to fix."
+    exit 1
+}
+
+cargo clippy -- -D warnings || {
+    echo "ERROR: cargo clippy failed."
+    exit 1
+}
+
+echo "Pre-push checks passed."

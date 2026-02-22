@@ -5,6 +5,7 @@ mod setup;
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use smithay_client_toolkit::{
@@ -19,7 +20,7 @@ use smithay_client_toolkit::{
     seat::{
         Capability, SeatHandler, SeatState,
         keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
-        pointer::{PointerEvent, PointerHandler},
+        pointer::{PointerEvent, PointerEventKind, PointerHandler},
     },
     shell::WaylandSurface,
     shell::xdg::{
@@ -56,6 +57,8 @@ struct Cli {
 enum Command {
     /// Run the screensaver (default)
     Run(RunArgs),
+    /// Stop a running instance
+    Stop,
     /// Interactive setup wizard
     Setup,
 }
@@ -66,9 +69,13 @@ struct RunArgs {
     #[arg(long)]
     timeout: Option<u32>,
 
-    /// Immediately activate the screensaver
+    /// Send SIGUSR1 to a running instance to activate it
     #[arg(long)]
     activate: bool,
+
+    /// Start and immediately show the screensaver (skip idle wait)
+    #[arg(long)]
+    now: bool,
 
     /// Clock font size in pixels
     #[arg(long)]
@@ -93,6 +100,7 @@ struct Screensaver {
     renderer: Option<Renderer>,
     animation: Option<Animation>,
     inhibitor: Option<ZwpIdleInhibitorV1>,
+    activated_at: Instant,
 }
 
 struct App {
@@ -140,7 +148,17 @@ impl App {
             renderer: None,
             animation: None,
             inhibitor,
+            activated_at: Instant::now(),
         });
+    }
+
+    fn dismiss(&mut self) {
+        if let Some(ref ss) = self.screensaver {
+            if ss.activated_at.elapsed() < std::time::Duration::from_secs(1) {
+                return;
+            }
+        }
+        self.deactivate();
     }
 
     fn deactivate(&mut self) {
@@ -433,7 +451,7 @@ impl KeyboardHandler for App {
         _serial: u32,
         _event: KeyEvent,
     ) {
-        self.deactivate();
+        self.dismiss();
     }
 
     fn repeat_key(
@@ -475,9 +493,15 @@ impl PointerHandler for App {
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
         _pointer: &wl_pointer::WlPointer,
-        _events: &[PointerEvent],
+        events: &[PointerEvent],
     ) {
-        self.deactivate();
+        let has_input = events.iter().any(|e| !matches!(
+            e.kind,
+            PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. }
+        ));
+        if has_input {
+            self.dismiss();
+        }
     }
 }
 
@@ -629,7 +653,7 @@ fn run(args: RunArgs) {
         width: 0,
         height: 0,
         running: true,
-        signal_activate: false,
+        signal_activate: args.now,
     };
 
     let mut event_loop: EventLoop<App> =
@@ -681,12 +705,34 @@ fn run(args: RunArgs) {
     let _ = std::fs::remove_file(pid_path());
 }
 
+fn stop() {
+    let path = pid_path();
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match contents.trim().parse::<i32>() {
+            Ok(pid) => {
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+                println!("Stopped olsvr (PID {pid})");
+                let _ = std::fs::remove_file(&path);
+            }
+            Err(_) => {
+                eprintln!("Invalid PID file at {}", path.display());
+                std::process::exit(1);
+            }
+        },
+        Err(_) => {
+            eprintln!("No running olsvr instance found");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     env_logger::init();
     let cli = Cli::parse();
 
     match cli.command {
         Some(Command::Setup) => setup::run(),
+        Some(Command::Stop) => stop(),
         Some(Command::Run(args)) => run(args),
         None => {
             // First-run detection: no config file and no --activate → launch wizard
@@ -699,6 +745,7 @@ fn main() {
                 run(RunArgs {
                     timeout: None,
                     activate: false,
+                    now: false,
                     font_size: None,
                     hold: None,
                     fade_duration: None,

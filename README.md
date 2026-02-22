@@ -14,8 +14,7 @@
 
 olsvr prevents OLED burn-in by displaying a fading clock that periodically repositions itself on a pure black background. It activates after a configurable idle timeout, renders with GPU acceleration via wgpu, and dismisses on any keyboard or mouse input.
 
-<!-- TODO: Add screenshot — launch olsvr, press Print Screen, save as docs/demo.png -->
-<!-- ![Demo](docs/demo.png) -->
+![Demo](docs/demo.png)
 
 ### Contents
 
@@ -50,6 +49,15 @@ olsvr setup
 
 # Or run directly with defaults
 olsvr run
+
+# Trigger a running instance to show immediately
+olsvr run --activate
+
+# Preview the screensaver (shows instantly, dismiss with any input)
+olsvr run --now
+
+# Stop a running instance
+olsvr stop
 ```
 
 ---

@@ -47,10 +47,14 @@ pub fn run() {
             .unwrap();
 
         if do_preview == 0 {
-            println!("  Launching preview... press any key or move the mouse to dismiss.");
-            println!();
             let exe = std::env::current_exe().unwrap_or_else(|_| "olsvr".into());
-            let _ = Command::new(exe).arg("run").spawn().and_then(|mut c| c.wait());
+            if let Ok(mut child) = Command::new(exe).args(["run", "--now"]).spawn() {
+                println!("  Preview running. Press Enter here to stop.");
+                println!();
+                let _ = std::io::stdin().read_line(&mut String::new());
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
 
         // Satisfaction check

@@ -3,6 +3,7 @@ use std::ptr::NonNull;
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
     TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
+    cosmic_text::Align,
 };
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
@@ -104,8 +105,10 @@ impl Renderer {
         let fs = app_config.font_size as f32;
         let family = app_config.font_family_enum();
 
+        let block_w = fs * 3.0;
+
         let mut time_buffer = Buffer::new(&mut font_system, Metrics::new(fs, fs * 1.2));
-        time_buffer.set_size(&mut font_system, Some(width as f32), Some(fs * 1.5));
+        time_buffer.set_size(&mut font_system, Some(block_w), Some(fs * 1.5));
         time_buffer.set_text(
             &mut font_system,
             "00:00",
@@ -113,11 +116,14 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
+        for line in time_buffer.lines.iter_mut() {
+            line.set_align(Some(Align::Center));
+        }
         time_buffer.shape_until_scroll(&mut font_system, false);
 
         let date_fs = fs * 0.3;
         let mut date_buffer = Buffer::new(&mut font_system, Metrics::new(date_fs, date_fs * 1.2));
-        date_buffer.set_size(&mut font_system, Some(width as f32), Some(date_fs * 1.5));
+        date_buffer.set_size(&mut font_system, Some(block_w), Some(date_fs * 1.5));
         date_buffer.set_text(
             &mut font_system,
             "Mon 01 Jan",
@@ -125,6 +131,9 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
+        for line in date_buffer.lines.iter_mut() {
+            line.set_align(Some(Align::Center));
+        }
         date_buffer.shape_until_scroll(&mut font_system, false);
 
         Self {
@@ -179,6 +188,9 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
+        for line in self.time_buffer.lines.iter_mut() {
+            line.set_align(Some(Align::Center));
+        }
         self.time_buffer
             .shape_until_scroll(&mut self.font_system, false);
 
@@ -189,6 +201,9 @@ impl Renderer {
             Shaping::Advanced,
             None,
         );
+        for line in self.date_buffer.lines.iter_mut() {
+            line.set_align(Some(Align::Center));
+        }
         self.date_buffer
             .shape_until_scroll(&mut self.font_system, false);
 

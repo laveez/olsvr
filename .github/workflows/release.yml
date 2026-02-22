@@ -31,8 +31,51 @@ jobs:
             git push origin main
           fi
 
+      - name: Generate changelog
+        run: |
+          # Find the previous tag
+          PREV_TAG=$(git tag --sort=-creatordate | grep -E '^v' | sed -n '2p')
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="HEAD"
+          else
+            RANGE="${PREV_TAG}..HEAD"
+          fi
+
+          # Collect commits grouped by type
+          features=""
+          fixes=""
+          other=""
+
+          while IFS= read -r msg; do
+            [ -z "$msg" ] && continue
+            case "$msg" in
+              Feature:*) features="${features}\n- ${msg#*: }" ;;
+              Fix:*)     fixes="${fixes}\n- ${msg#*: }" ;;
+              Chore:*|Docs:*|Refactor:*|Test:*) ;;
+              *)         other="${other}\n- ${msg}" ;;
+            esac
+          done <<< "$(git log --format='%s' "$RANGE")"
+
+          # Build release body
+          body=""
+          if [ -n "$features" ]; then
+            body="${body}### Features\n${features}\n\n"
+          fi
+          if [ -n "$fixes" ]; then
+            body="${body}### Fixes\n${fixes}\n\n"
+          fi
+          if [ -n "$other" ]; then
+            body="${body}### Other\n${other}\n\n"
+          fi
+
+          if [ -z "$body" ]; then
+            body="Maintenance release."
+          fi
+
+          echo -e "$body" > /tmp/release-notes.md
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
           TAG_NAME: ${{ github.ref_name }}
-        run: gh release create "$TAG_NAME" --generate-notes
+        run: gh release create "$TAG_NAME" --notes-file /tmp/release-notes.md

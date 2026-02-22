@@ -14,6 +14,7 @@ pub struct Animation {
     phase_start: Instant,
     fade_duration: Duration,
     hold_duration: Duration,
+    edge_padding: f32,
     x: f32,
     y: f32,
     last_quadrant: u8,
@@ -30,12 +31,15 @@ impl Animation {
         text_width: f32,
         text_height: f32,
         hold_secs: u32,
+        fade_duration_ms: u32,
+        edge_padding: u32,
     ) -> Self {
         let mut anim = Self {
             phase: Phase::Teleport,
             phase_start: Instant::now(),
-            fade_duration: Duration::from_millis(1500),
+            fade_duration: Duration::from_millis(fade_duration_ms as u64),
             hold_duration: Duration::from_secs(hold_secs as u64),
+            edge_padding: edge_padding as f32,
             x: 0.0,
             y: 0.0,
             last_quadrant: u8::MAX, // so first pick is unconstrained
@@ -126,7 +130,7 @@ impl Animation {
 
         let half_w = self.screen_width / 2.0;
         let half_h = self.screen_height / 2.0;
-        let pad = 50.0;
+        let pad = self.edge_padding;
 
         let (x_min, x_max) = match quadrant % 2 {
             0 => (pad, (half_w - self.text_width - pad).max(pad + 1.0)),

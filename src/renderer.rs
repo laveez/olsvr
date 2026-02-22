@@ -10,22 +10,27 @@ use raw_window_handle::{
 use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Proxy};
 
+use crate::config::Config;
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
-    // Text rendering
     font_system: FontSystem,
     swash_cache: SwashCache,
     text_atlas: TextAtlas,
     text_renderer: TextRenderer,
-    #[allow(dead_code)] // Owned by glyphon rendering pipeline
+    #[allow(dead_code)]
     cache: Cache,
     viewport: Viewport,
     time_buffer: Buffer,
     date_buffer: Buffer,
     font_size: f32,
+    font_family: String,
+    time_format: String,
+    date_format: String,
+    text_color: [u8; 3],
 }
 
 impl Renderer {
@@ -34,7 +39,7 @@ impl Renderer {
         wl_surface: &WlSurface,
         width: u32,
         height: u32,
-        font_size: u32,
+        app_config: &Config,
     ) -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
@@ -85,7 +90,6 @@ impl Renderer {
         };
         surface.configure(&device, &config);
 
-        // Text rendering setup
         let mut font_system = FontSystem::new();
         let swash_cache = SwashCache::new();
         let cache = Cache::new(&device);
@@ -95,28 +99,27 @@ impl Renderer {
         let text_renderer =
             TextRenderer::new(&mut text_atlas, &device, wgpu::MultisampleState::default(), None);
 
-        let fs = font_size as f32;
+        let fs = app_config.font_size as f32;
+        let family = app_config.font_family_enum();
 
-        // Time buffer (large): "23:47"
         let mut time_buffer = Buffer::new(&mut font_system, Metrics::new(fs, fs * 1.2));
         time_buffer.set_size(&mut font_system, Some(width as f32), Some(fs * 1.5));
         time_buffer.set_text(
             &mut font_system,
             "00:00",
-            &Attrs::new().family(Family::SansSerif),
+            &Attrs::new().family(family),
             Shaping::Advanced,
             None,
         );
         time_buffer.shape_until_scroll(&mut font_system, false);
 
-        // Date buffer (smaller): "Fri 21 Feb"
         let date_fs = fs * 0.3;
         let mut date_buffer = Buffer::new(&mut font_system, Metrics::new(date_fs, date_fs * 1.2));
         date_buffer.set_size(&mut font_system, Some(width as f32), Some(date_fs * 1.5));
         date_buffer.set_text(
             &mut font_system,
             "Mon 01 Jan",
-            &Attrs::new().family(Family::SansSerif),
+            &Attrs::new().family(family),
             Shaping::Advanced,
             None,
         );
@@ -136,6 +139,10 @@ impl Renderer {
             time_buffer,
             date_buffer,
             font_size: fs,
+            font_family: app_config.font_family.clone(),
+            time_format: app_config.time_format.clone(),
+            date_format: app_config.date_format.clone(),
+            text_color: app_config.color,
         }
     }
 
@@ -145,18 +152,28 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    /// Update text content and render a frame.
-    /// `x`, `y` are the top-left position of the time text.
-    /// `alpha` is 0-255 for fade effect.
     pub fn render_frame(&mut self, x: f32, y: f32, alpha: u8) {
         let now = chrono::Local::now();
-        let time_str = now.format("%H:%M").to_string();
-        let date_str = now.format("%a %d %b").to_string();
+        let time_fmt = match self.time_format.as_str() {
+            "12h" => "%I:%M %p",
+            _ => "%H:%M",
+        };
+        let time_str = now.format(time_fmt).to_string();
+        let date_str = now.format(&self.date_format).to_string();
+
+        let family = match self.font_family.as_str() {
+            "sans-serif" => Family::SansSerif,
+            "serif" => Family::Serif,
+            "monospace" => Family::Monospace,
+            "cursive" => Family::Cursive,
+            "fantasy" => Family::Fantasy,
+            name => Family::Name(name),
+        };
 
         self.time_buffer.set_text(
             &mut self.font_system,
             &time_str,
-            &Attrs::new().family(Family::SansSerif),
+            &Attrs::new().family(family),
             Shaping::Advanced,
             None,
         );
@@ -166,7 +183,7 @@ impl Renderer {
         self.date_buffer.set_text(
             &mut self.font_system,
             &date_str,
-            &Attrs::new().family(Family::SansSerif),
+            &Attrs::new().family(family),
             Shaping::Advanced,
             None,
         );
@@ -175,9 +192,9 @@ impl Renderer {
 
         let w = self.config.width;
         let h = self.config.height;
-        let color = Color::rgba(255, 255, 255, alpha);
+        let [r, g, b] = self.text_color;
+        let color = Color::rgba(r, g, b, alpha);
 
-        // Date sits below the time
         let date_y = y + self.font_size * 1.2;
 
         self.viewport.update(
@@ -264,16 +281,11 @@ impl Renderer {
         self.text_atlas.trim();
     }
 
-    /// Approximate width of the rendered time text block.
     pub fn text_block_width(&self) -> f32 {
-        // "HH:MM" is roughly 3 characters wide at font_size
         self.font_size * 3.0
     }
 
-    /// Approximate height of time + date text block.
     pub fn text_block_height(&self) -> f32 {
-        // Time line + date line
         self.font_size * 1.2 + self.font_size * 0.3 * 1.2
     }
-
 }

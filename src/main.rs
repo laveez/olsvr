@@ -1,10 +1,12 @@
 mod animation;
+mod config;
 mod renderer;
+mod setup;
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
@@ -40,30 +42,53 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
 };
 
 use crate::animation::Animation;
+use crate::config::Config;
 use crate::renderer::Renderer;
 
 #[derive(Parser)]
 #[command(name = "olsvr", about = "OLED screensaver for Wayland")]
-struct Args {
+struct Cli {
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// Run the screensaver (default)
+    Run(RunArgs),
+    /// Interactive setup wizard
+    Setup,
+}
+
+#[derive(Parser)]
+struct RunArgs {
     /// Idle timeout in minutes before activation
-    #[arg(long, default_value_t = 5)]
-    timeout: u32,
+    #[arg(long)]
+    timeout: Option<u32>,
 
     /// Immediately activate the screensaver
     #[arg(long)]
     activate: bool,
 
     /// Clock font size in pixels
-    #[arg(long, default_value_t = 200)]
-    font_size: u32,
+    #[arg(long)]
+    font_size: Option<u32>,
 
     /// Hold duration between fades in seconds
-    #[arg(long, default_value_t = 10)]
-    hold: u32,
+    #[arg(long)]
+    hold: Option<u32>,
+
+    /// Fade duration in milliseconds
+    #[arg(long)]
+    fade_duration: Option<u32>,
+
+    /// Edge padding in pixels
+    #[arg(long)]
+    edge_padding: Option<u32>,
 }
 
 struct Screensaver {
-    #[allow(dead_code)] // Kept alive to maintain the Wayland surface
+    #[allow(dead_code)]
     window: Window,
     renderer: Option<Renderer>,
     animation: Option<Animation>,
@@ -84,8 +109,7 @@ struct App {
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
-    font_size: u32,
-    hold: u32,
+    config: Config,
     width: u32,
     height: u32,
     running: bool,
@@ -106,13 +130,11 @@ impl App {
         window.set_app_id("olsvr");
         window.commit();
 
-        // Create idle inhibitor to prevent system sleep while screensaver is active
         let inhibitor = self
             .idle_inhibit_manager
             .as_ref()
             .map(|mgr| mgr.create_inhibitor(window.wl_surface(), qh, ()));
 
-        // Renderer/animation are created in configure callback when we know the size
         self.screensaver = Some(Screensaver {
             window,
             renderer: None,
@@ -127,7 +149,6 @@ impl App {
             if let Some(inhibitor) = ss.inhibitor {
                 inhibitor.destroy();
             }
-            // Drop destroys the window and its Wayland resources
         }
     }
 
@@ -348,14 +369,16 @@ impl WindowHandler for App {
                     window.wl_surface(),
                     w,
                     h,
-                    self.font_size,
+                    &self.config,
                 );
                 let animation = Animation::new(
                     w as f32,
                     h as f32,
                     renderer.text_block_width(),
                     renderer.text_block_height(),
-                    self.hold,
+                    self.config.hold,
+                    self.config.fade_duration,
+                    self.config.edge_padding,
                 );
                 ss.renderer = Some(renderer);
                 ss.animation = Some(animation);
@@ -458,7 +481,6 @@ impl PointerHandler for App {
     }
 }
 
-// Idle notification dispatch
 impl Dispatch<ExtIdleNotificationV1, ()> for App {
     fn event(
         state: &mut Self,
@@ -540,10 +562,15 @@ fn pid_path() -> PathBuf {
     PathBuf::from(format!("/run/user/{uid}/olsvr.pid"))
 }
 
-fn main() {
-    env_logger::init();
-    let args = Args::parse();
+fn merge_cli(config: &mut Config, args: &RunArgs) {
+    if let Some(v) = args.timeout { config.timeout = v; }
+    if let Some(v) = args.font_size { config.font_size = v; }
+    if let Some(v) = args.hold { config.hold = v; }
+    if let Some(v) = args.fade_duration { config.fade_duration = v; }
+    if let Some(v) = args.edge_padding { config.edge_padding = v; }
+}
 
+fn run(args: RunArgs) {
     // --activate: send SIGUSR1 to running instance and exit
     if args.activate {
         let path = pid_path();
@@ -558,6 +585,9 @@ fn main() {
         std::process::exit(1);
     }
 
+    let mut config = Config::load();
+    merge_cli(&mut config, &args);
+
     // Write PID file
     let path = pid_path();
     std::fs::write(&path, std::process::id().to_string()).expect("Failed to write PID file");
@@ -570,13 +600,11 @@ fn main() {
         CompositorState::bind(&globals, &qh).expect("wl_compositor not available");
     let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_wm_base not available");
 
-    // Bind idle notifier (optional — not all compositors support it)
     let idle_notifier: Option<ExtIdleNotifierV1> = globals.bind(&qh, 1..=1, ()).ok();
     if idle_notifier.is_none() {
         log::warn!("ext_idle_notifier_v1 not available — idle detection disabled");
     }
 
-    // Bind idle inhibit manager (optional)
     let idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1> =
         globals.bind(&qh, 1..=1, ()).ok();
     if idle_inhibit_manager.is_none() {
@@ -597,8 +625,7 @@ fn main() {
         seat: None,
         keyboard: None,
         pointer: None,
-        font_size: args.font_size,
-        hold: args.hold,
+        config,
         width: 0,
         height: 0,
         running: true,
@@ -612,7 +639,6 @@ fn main() {
         .insert(event_loop.handle())
         .expect("Failed to insert Wayland source");
 
-    // Register signal handlers
     let signals = Signals::new(&[Signal::SIGUSR1, Signal::SIGTERM, Signal::SIGINT])
         .expect("Failed to create signal source");
     event_loop
@@ -630,14 +656,12 @@ fn main() {
         })
         .expect("Failed to insert signal source");
 
-    // Do initial roundtrip to get seat
     event_loop
         .dispatch(std::time::Duration::from_millis(100), &mut app)
         .expect("Initial dispatch failed");
 
     if let (Some(notifier), Some(seat)) = (&app.idle_notifier, &app.seat) {
-        // Set up idle notification
-        let timeout_ms = args.timeout * 60 * 1000;
+        let timeout_ms = app.config.timeout * 60 * 1000;
         log::info!("Setting up idle notification: {}ms", timeout_ms);
         let notification = notifier.get_idle_notification(timeout_ms, seat, &qh, ());
         app.idle_notification = Some(notification);
@@ -654,6 +678,33 @@ fn main() {
         }
     }
 
-    // Clean up PID file
     let _ = std::fs::remove_file(pid_path());
+}
+
+fn main() {
+    env_logger::init();
+    let cli = Cli::parse();
+
+    match cli.command {
+        Some(Command::Setup) => setup::run(),
+        Some(Command::Run(args)) => run(args),
+        None => {
+            // First-run detection: no config file and no --activate → launch wizard
+            if !Config::exists() {
+                println!("  No config file found. Starting setup wizard...");
+                println!("  (Run `olsvr run` to skip setup and use defaults)");
+                println!();
+                setup::run();
+            } else {
+                run(RunArgs {
+                    timeout: None,
+                    activate: false,
+                    font_size: None,
+                    hold: None,
+                    fade_duration: None,
+                    edge_padding: None,
+                });
+            }
+        }
+    }
 }

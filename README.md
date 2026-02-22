@@ -14,7 +14,7 @@
 
 olsvr prevents OLED burn-in by displaying a fading clock that periodically repositions itself on a pure black background. It activates after a configurable idle timeout, renders with GPU acceleration via wgpu, and dismisses on any keyboard or mouse input.
 
-![Demo](docs/demo.png)
+![Demo](docs/demo.webp)
 
 ### Contents
 
@@ -25,7 +25,7 @@ olsvr prevents OLED burn-in by displaying a fading clock that periodically repos
 
 ## Features
 
-- **Idle detection** — activates via `ext-idle-notify-v1` after configurable timeout
+- **Idle detection** — activates via `ext-idle-notify-v1` or D-Bus (GNOME) after configurable timeout
 - **Fade animation** — clock fades in, holds, fades out, then teleports to a new position
 - **Quadrant-aware repositioning** — never lands in the same screen quadrant twice in a row
 - **GPU-accelerated** — wgpu + glyphon text rendering on Vulkan
@@ -126,11 +126,12 @@ The screensaver creates a fullscreen Wayland window with a pure black background
 
 ## Requirements
 
-- **Wayland compositor** with `ext-idle-notify-v1` (GNOME/Mutter 46+, Sway 1.9+, etc.)
+- **Wayland compositor** — GNOME, Sway, Hyprland, etc.
 - **Rust toolchain** for building from source
 - **GPU** with Vulkan support (wgpu backend)
+- **libdbus** (for GNOME D-Bus fallback) — `libdbus-1-dev` on Debian/Ubuntu, `dbus-devel` on Fedora
 
-> Compositors without `ext-idle-notify-v1` can still use olsvr via manual trigger: `olsvr run --activate`
+> Idle detection uses `ext-idle-notify-v1` (Sway, Hyprland) with automatic D-Bus fallback for GNOME/Mutter. Manual trigger is also available: `olsvr run --activate`
 
 ---
 

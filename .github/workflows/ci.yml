@@ -17,7 +17,7 @@ jobs:
         with:
           components: clippy, rustfmt
       - name: Install Wayland dev libraries
-        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libwayland-dev libxkbcommon-dev libdbus-1-dev pkg-config
       - run: cargo check
       - run: cargo clippy -- -D warnings
       - run: cargo fmt --check

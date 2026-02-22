@@ -61,7 +61,12 @@ pub fn run() {
         println!();
         let choice = Select::with_theme(&theme)
             .with_prompt("Happy with this configuration?")
-            .items(&["Yes, continue", "Change timing", "Change display", "Start over"])
+            .items(&[
+                "Yes, continue",
+                "Change timing",
+                "Change display",
+                "Start over",
+            ])
             .default(0)
             .interact()
             .unwrap();

@@ -67,12 +67,10 @@ impl Renderer {
         }))
         .expect("No suitable GPU adapter found");
 
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor {
-                label: Some("olsvr"),
-                ..Default::default()
-            },
-        ))
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("olsvr"),
+            ..Default::default()
+        }))
         .expect("Failed to create device");
 
         let caps = surface.get_capabilities(&adapter);
@@ -96,8 +94,12 @@ impl Renderer {
         let viewport = Viewport::new(&device, &cache);
         let text_atlas = TextAtlas::new(&device, &queue, &cache, format);
         let mut text_atlas = text_atlas;
-        let text_renderer =
-            TextRenderer::new(&mut text_atlas, &device, wgpu::MultisampleState::default(), None);
+        let text_renderer = TextRenderer::new(
+            &mut text_atlas,
+            &device,
+            wgpu::MultisampleState::default(),
+            None,
+        );
 
         let fs = app_config.font_size as f32;
         let family = app_config.font_family_enum();

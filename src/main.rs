@@ -13,7 +13,10 @@ use smithay_client_toolkit::{
     delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
     delegate_seat, delegate_xdg_shell, delegate_xdg_window,
     output::{OutputHandler, OutputState},
-    reexports::calloop::{signals::{Signal, Signals}, EventLoop},
+    reexports::calloop::{
+        EventLoop,
+        signals::{Signal, Signals},
+    },
     reexports::calloop_wayland_source::WaylandSource,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
@@ -24,22 +27,21 @@ use smithay_client_toolkit::{
     },
     shell::WaylandSurface,
     shell::xdg::{
-        window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
         XdgShell,
+        window::{Window, WindowConfigure, WindowDecorations, WindowHandler},
     },
 };
 use wayland_client::{
+    Connection, Dispatch, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_pointer, wl_seat, wl_surface},
-    Connection, Dispatch, QueueHandle,
 };
 use wayland_protocols::ext::idle_notify::v1::client::{
     ext_idle_notification_v1::{self, ExtIdleNotificationV1},
     ext_idle_notifier_v1::{self, ExtIdleNotifierV1},
 };
 use wayland_protocols::wp::idle_inhibit::zv1::client::{
-    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1,
-    zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
+    zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
 
 use crate::animation::Animation;
@@ -132,7 +134,9 @@ impl App {
         log::info!("Activating screensaver");
 
         let surface = self.compositor_state.create_surface(qh);
-        let window = self.xdg_shell.create_window(surface, WindowDecorations::None, qh);
+        let window = self
+            .xdg_shell
+            .create_window(surface, WindowDecorations::None, qh);
         window.set_fullscreen(None);
         window.set_title("olsvr");
         window.set_app_id("olsvr");
@@ -153,10 +157,10 @@ impl App {
     }
 
     fn dismiss(&mut self) {
-        if let Some(ref ss) = self.screensaver {
-            if ss.activated_at.elapsed() < std::time::Duration::from_secs(1) {
-                return;
-            }
+        if let Some(ref ss) = self.screensaver
+            && ss.activated_at.elapsed() < std::time::Duration::from_secs(1)
+        {
+            return;
         }
         self.deactivate();
     }
@@ -171,15 +175,13 @@ impl App {
     }
 
     fn draw(&mut self) {
-        if let Some(ref mut ss) = self.screensaver {
-            if let (Some(anim), Some(renderer)) =
-                (&mut ss.animation, &mut ss.renderer)
-            {
-                anim.tick();
-                let (x, y) = anim.position();
-                let alpha = anim.alpha();
-                renderer.render_frame(x, y, alpha);
-            }
+        if let Some(ref mut ss) = self.screensaver
+            && let (Some(anim), Some(renderer)) = (&mut ss.animation, &mut ss.renderer)
+        {
+            anim.tick();
+            let (x, y) = anim.position();
+            let alpha = anim.alpha();
+            renderer.render_frame(x, y, alpha);
         }
     }
 }
@@ -245,12 +247,12 @@ impl OutputHandler for App {
         _qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        if let Some(info) = self.output_state.info(&output) {
-            if let Some(mode) = info.modes.iter().find(|m| m.current) {
-                self.width = mode.dimensions.0 as u32;
-                self.height = mode.dimensions.1 as u32;
-                log::info!("Output: {}x{}", self.width, self.height);
-            }
+        if let Some(info) = self.output_state.info(&output)
+            && let Some(mode) = info.modes.iter().find(|m| m.current)
+        {
+            self.width = mode.dimensions.0 as u32;
+            self.height = mode.dimensions.1 as u32;
+            log::info!("Output: {}x{}", self.width, self.height);
         }
     }
 
@@ -260,11 +262,11 @@ impl OutputHandler for App {
         _qh: &QueueHandle<Self>,
         output: wl_output::WlOutput,
     ) {
-        if let Some(info) = self.output_state.info(&output) {
-            if let Some(mode) = info.modes.iter().find(|m| m.current) {
-                self.width = mode.dimensions.0 as u32;
-                self.height = mode.dimensions.1 as u32;
-            }
+        if let Some(info) = self.output_state.info(&output)
+            && let Some(mode) = info.modes.iter().find(|m| m.current)
+        {
+            self.width = mode.dimensions.0 as u32;
+            self.height = mode.dimensions.1 as u32;
         }
     }
 
@@ -282,12 +284,7 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        seat: wl_seat::WlSeat,
-    ) {
+    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         if self.seat.is_none() {
             self.seat = Some(seat);
         }
@@ -323,34 +320,24 @@ impl SeatHandler for App {
         _seat: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Keyboard {
-            if let Some(kb) = self.keyboard.take() {
-                kb.release();
-            }
+        if capability == Capability::Keyboard
+            && let Some(kb) = self.keyboard.take()
+        {
+            kb.release();
         }
-        if capability == Capability::Pointer {
-            if let Some(ptr) = self.pointer.take() {
-                ptr.release();
-            }
+        if capability == Capability::Pointer
+            && let Some(ptr) = self.pointer.take()
+        {
+            ptr.release();
         }
     }
 
-    fn remove_seat(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _seat: wl_seat::WlSeat,
-    ) {
+    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
     }
 }
 
 impl WindowHandler for App {
-    fn request_close(
-        &mut self,
-        _conn: &Connection,
-        _qh: &QueueHandle<Self>,
-        _window: &Window,
-    ) {
+    fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _window: &Window) {
         self.deactivate();
     }
 
@@ -382,13 +369,7 @@ impl WindowHandler for App {
 
             if ss.renderer.is_none() {
                 log::info!("Window configured: {w}x{h}, initializing renderer");
-                let renderer = Renderer::new(
-                    &self.conn,
-                    window.wl_surface(),
-                    w,
-                    h,
-                    &self.config,
-                );
+                let renderer = Renderer::new(&self.conn, window.wl_surface(), w, h, &self.config);
                 let animation = Animation::new(
                     w as f32,
                     h as f32,
@@ -495,10 +476,12 @@ impl PointerHandler for App {
         _pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        let has_input = events.iter().any(|e| !matches!(
-            e.kind,
-            PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. }
-        ));
+        let has_input = events.iter().any(|e| {
+            !matches!(
+                e.kind,
+                PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. }
+            )
+        });
         if has_input {
             self.dismiss();
         }
@@ -587,25 +570,38 @@ fn pid_path() -> PathBuf {
 }
 
 fn merge_cli(config: &mut Config, args: &RunArgs) {
-    if let Some(v) = args.timeout { config.timeout = v; }
-    if let Some(v) = args.font_size { config.font_size = v; }
-    if let Some(v) = args.hold { config.hold = v; }
-    if let Some(v) = args.fade_duration { config.fade_duration = v; }
-    if let Some(v) = args.edge_padding { config.edge_padding = v; }
+    if let Some(v) = args.timeout {
+        config.timeout = v;
+    }
+    if let Some(v) = args.font_size {
+        config.font_size = v;
+    }
+    if let Some(v) = args.hold {
+        config.hold = v;
+    }
+    if let Some(v) = args.fade_duration {
+        config.fade_duration = v;
+    }
+    if let Some(v) = args.edge_padding {
+        config.edge_padding = v;
+    }
 }
 
 fn run(args: RunArgs) {
     // --activate: send SIGUSR1 to running instance and exit
     if args.activate {
         let path = pid_path();
-        if let Ok(contents) = std::fs::read_to_string(&path) {
-            if let Ok(pid) = contents.trim().parse::<i32>() {
-                log::info!("Sending SIGUSR1 to PID {pid}");
-                unsafe { libc::kill(pid, libc::SIGUSR1) };
-                return;
-            }
+        if let Ok(contents) = std::fs::read_to_string(&path)
+            && let Ok(pid) = contents.trim().parse::<i32>()
+        {
+            log::info!("Sending SIGUSR1 to PID {pid}");
+            unsafe { libc::kill(pid, libc::SIGUSR1) };
+            return;
         }
-        eprintln!("No running olsvr instance found (no PID file at {})", path.display());
+        eprintln!(
+            "No running olsvr instance found (no PID file at {})",
+            path.display()
+        );
         std::process::exit(1);
     }
 
@@ -629,8 +625,7 @@ fn run(args: RunArgs) {
         log::warn!("ext_idle_notifier_v1 not available — idle detection disabled");
     }
 
-    let idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1> =
-        globals.bind(&qh, 1..=1, ()).ok();
+    let idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
     if idle_inhibit_manager.is_none() {
         log::warn!("zwp_idle_inhibit_manager_v1 not available — idle inhibition disabled");
     }
@@ -656,8 +651,7 @@ fn run(args: RunArgs) {
         signal_activate: args.now,
     };
 
-    let mut event_loop: EventLoop<App> =
-        EventLoop::try_new().expect("Failed to create event loop");
+    let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("Failed to create event loop");
 
     WaylandSource::new(conn, event_queue)
         .insert(event_loop.handle())

@@ -41,7 +41,7 @@ pub fn run() {
         println!();
         let do_preview = Select::with_theme(&theme)
             .with_prompt("Launch a live preview?")
-            .items(&["Yes", "No"])
+            .items(["Yes", "No"])
             .default(0)
             .interact()
             .unwrap();
@@ -61,7 +61,7 @@ pub fn run() {
         println!();
         let choice = Select::with_theme(&theme)
             .with_prompt("Happy with this configuration?")
-            .items(&[
+            .items([
                 "Yes, continue",
                 "Change timing",
                 "Change display",
@@ -95,7 +95,7 @@ pub fn run() {
     println!();
     let install = Select::with_theme(&theme)
         .with_prompt("Install as systemd user service?")
-        .items(&["Yes", "No"])
+        .items(["Yes", "No"])
         .default(0)
         .interact()
         .unwrap();
@@ -151,7 +151,7 @@ fn prompt_display(theme: &ColorfulTheme, config: &mut Config) {
         .unwrap_or(0);
     let family_idx = Select::with_theme(theme)
         .with_prompt("Font family")
-        .items(&families)
+        .items(families)
         .default(current_idx)
         .interact()
         .unwrap();
@@ -161,7 +161,7 @@ fn prompt_display(theme: &ColorfulTheme, config: &mut Config) {
     let current_fmt = if config.time_format == "12h" { 1 } else { 0 };
     let fmt_idx = Select::with_theme(theme)
         .with_prompt("Time format")
-        .items(&formats)
+        .items(formats)
         .default(current_fmt)
         .interact()
         .unwrap();

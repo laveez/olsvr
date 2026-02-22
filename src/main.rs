@@ -181,6 +181,7 @@ impl App {
             anim.tick();
             let (x, y) = anim.position();
             let alpha = anim.alpha();
+            log::trace!("draw: alpha={alpha} pos=({x:.0},{y:.0}) phase={}", anim.phase_name());
             renderer.render_frame(x, y, alpha);
         }
     }
@@ -212,8 +213,8 @@ impl CompositorHandler for App {
         surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        self.draw();
         surface.frame(qh, surface.clone());
+        self.draw();
         surface.commit();
     }
 
@@ -382,9 +383,9 @@ impl WindowHandler for App {
                 ss.renderer = Some(renderer);
                 ss.animation = Some(animation);
 
-                self.draw();
                 let wl_surface = window.wl_surface();
                 wl_surface.frame(qh, wl_surface.clone());
+                self.draw();
                 wl_surface.commit();
             } else if let Some(ref mut renderer) = ss.renderer {
                 renderer.resize(w, h);
@@ -473,17 +474,20 @@ impl PointerHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _pointer: &wl_pointer::WlPointer,
+        pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
-        let has_input = events.iter().any(|e| {
-            !matches!(
-                e.kind,
-                PointerEventKind::Enter { .. } | PointerEventKind::Leave { .. }
-            )
-        });
-        if has_input {
-            self.dismiss();
+        for event in events {
+            match event.kind {
+                PointerEventKind::Enter { serial } => {
+                    pointer.set_cursor(serial, None, 0, 0);
+                }
+                PointerEventKind::Leave { .. } => {}
+                _ => {
+                    self.dismiss();
+                    return;
+                }
+            }
         }
     }
 }

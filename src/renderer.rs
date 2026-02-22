@@ -252,6 +252,16 @@ impl Renderer {
 
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
+            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+                self.surface.configure(&self.device, &self.config);
+                match self.surface.get_current_texture() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        log::warn!("Failed to get surface texture after reconfigure: {e}");
+                        return;
+                    }
+                }
+            }
             Err(e) => {
                 log::warn!("Failed to get surface texture: {e}");
                 return;

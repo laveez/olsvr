@@ -75,6 +75,15 @@ impl Animation {
         (self.x, self.y)
     }
 
+    pub fn phase_name(&self) -> &'static str {
+        match self.phase {
+            Phase::FadeIn => "FadeIn",
+            Phase::Hold => "Hold",
+            Phase::FadeOut => "FadeOut",
+            Phase::Teleport => "Teleport",
+        }
+    }
+
     pub fn tick(&mut self) {
         let elapsed = self.phase_start.elapsed();
         match self.phase {

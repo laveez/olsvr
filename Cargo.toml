@@ -19,7 +19,7 @@ calloop = { version = "0.14", features = ["signals"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
-rand = "0.9"
+rand = "0.10"
 raw-window-handle = "0.6"
 pollster = "0.4"
 serde = { version = "1", features = ["derive"] }

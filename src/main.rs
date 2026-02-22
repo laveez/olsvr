@@ -181,7 +181,10 @@ impl App {
             anim.tick();
             let (x, y) = anim.position();
             let alpha = anim.alpha();
-            log::trace!("draw: alpha={alpha} pos=({x:.0},{y:.0}) phase={}", anim.phase_name());
+            log::trace!(
+                "draw: alpha={alpha} pos=({x:.0},{y:.0}) phase={}",
+                anim.phase_name()
+            );
             renderer.render_frame(x, y, alpha);
         }
     }

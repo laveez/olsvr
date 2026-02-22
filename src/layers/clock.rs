@@ -13,6 +13,7 @@ pub struct ClockLayer {
     time_buffer: Option<Buffer>,
     date_buffer: Option<Buffer>,
     animation: Option<Animation>,
+    data_cache: Option<Arc<RwLock<DataCache>>>,
     font_size: f32,
     font_family: String,
     time_format: String,
@@ -34,6 +35,7 @@ impl Default for ClockLayer {
             time_buffer: None,
             date_buffer: None,
             animation: None,
+            data_cache: None,
             font_size: 200.0,
             font_family: "sans-serif".into(),
             time_format: "24h".into(),
@@ -82,8 +84,9 @@ impl Layer for ClockLayer {
         ctx: &GpuContext<'_>,
         font_system: &mut FontSystem,
         config: &toml::value::Table,
-        _data_cache: Arc<RwLock<DataCache>>,
+        data_cache: Arc<RwLock<DataCache>>,
     ) {
+        self.data_cache = Some(data_cache);
         if let Some(v) = config.get("font_size").and_then(|v| v.as_integer()) {
             self.font_size = v as f32;
         }
@@ -181,6 +184,19 @@ impl Layer for ClockLayer {
                 self.y,
                 anim.phase_name()
             );
+        }
+
+        // Publish position so other layers (weather) can follow
+        if let Some(ref cache) = self.data_cache
+            && let Ok(mut c) = cache.write()
+        {
+            c.clock_pos = Some(crate::data::ClockPosition {
+                x: self.x,
+                y: self.y,
+                alpha: self.current_alpha,
+                block_height: self.text_block_height(),
+                block_width: self.text_block_width(),
+            });
         }
     }
 

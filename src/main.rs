@@ -44,9 +44,62 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
     zwp_idle_inhibit_manager_v1::ZwpIdleInhibitManagerV1, zwp_idle_inhibitor_v1::ZwpIdleInhibitorV1,
 };
 
+use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
+
 use crate::animation::Animation;
 use crate::config::Config;
 use crate::renderer::Renderer;
+
+enum DbusIdleEvent {
+    Idle,
+    Resumed,
+}
+
+fn get_mutter_idletime(proxy: &dbus::blocking::Proxy<&dbus::blocking::Connection>) -> Option<u64> {
+    proxy
+        .method_call("org.gnome.Mutter.IdleMonitor", "GetIdletime", ())
+        .ok()
+        .map(|(ms,): (u64,)| ms)
+}
+
+fn dbus_idle_monitor_loop(tx: Sender<DbusIdleEvent>, timeout_ms: u64) {
+    let conn = match dbus::blocking::Connection::new_session() {
+        Ok(c) => c,
+        Err(e) => {
+            log::error!("D-Bus session connection failed: {e}");
+            return;
+        }
+    };
+    let proxy = conn.with_proxy(
+        "org.gnome.Mutter.IdleMonitor",
+        "/org/gnome/Mutter/IdleMonitor/Core",
+        std::time::Duration::from_secs(2),
+    );
+
+    let mut was_idle = false;
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let Some(idle_ms) = get_mutter_idletime(&proxy) else {
+            log::error!("GetIdletime call failed — stopping D-Bus monitor");
+            return;
+        };
+
+        if !was_idle && idle_ms >= timeout_ms {
+            log::info!("D-Bus: user idle ({idle_ms}ms) — activating screensaver");
+            if tx.send(DbusIdleEvent::Idle).is_err() {
+                return;
+            }
+            was_idle = true;
+        } else if was_idle && idle_ms < timeout_ms {
+            log::info!("D-Bus: user resumed — deactivating screensaver");
+            if tx.send(DbusIdleEvent::Resumed).is_err() {
+                return;
+            }
+            was_idle = false;
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "olsvr", about = "OLED screensaver for Wayland")]
@@ -124,6 +177,7 @@ struct App {
     height: u32,
     running: bool,
     signal_activate: bool,
+    signal_deactivate: bool,
 }
 
 impl App {
@@ -628,8 +682,9 @@ fn run(args: RunArgs) {
     let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_wm_base not available");
 
     let idle_notifier: Option<ExtIdleNotifierV1> = globals.bind(&qh, 1..=1, ()).ok();
+    let mut dbus_idle = false;
     if idle_notifier.is_none() {
-        log::warn!("ext_idle_notifier_v1 not available — idle detection disabled");
+        log::info!("ext_idle_notifier_v1 not available — trying D-Bus fallback");
     }
 
     let idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1> = globals.bind(&qh, 1..=1, ()).ok();
@@ -656,6 +711,7 @@ fn run(args: RunArgs) {
         height: 0,
         running: true,
         signal_activate: args.now,
+        signal_deactivate: false,
     };
 
     let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("Failed to create event loop");
@@ -687,9 +743,38 @@ fn run(args: RunArgs) {
 
     if let (Some(notifier), Some(seat)) = (&app.idle_notifier, &app.seat) {
         let timeout_ms = app.config.timeout * 60 * 1000;
-        log::info!("Setting up idle notification: {}ms", timeout_ms);
+        log::info!("Setting up Wayland idle notification: {}ms", timeout_ms);
         let notification = notifier.get_idle_notification(timeout_ms, seat, &qh, ());
         app.idle_notification = Some(notification);
+    } else if app.idle_notifier.is_none() {
+        let timeout_ms = app.config.timeout as u64 * 60 * 1000;
+        if let Ok(conn) = dbus::blocking::Connection::new_session() {
+            let proxy = conn.with_proxy(
+                "org.gnome.Mutter.IdleMonitor",
+                "/org/gnome/Mutter/IdleMonitor/Core",
+                std::time::Duration::from_secs(2),
+            );
+            if get_mutter_idletime(&proxy).is_some() {
+                log::info!("Using D-Bus Mutter IdleMonitor fallback: {}ms", timeout_ms);
+                let (tx, rx) = channel::channel::<DbusIdleEvent>();
+                std::thread::spawn(move || dbus_idle_monitor_loop(tx, timeout_ms));
+                event_loop
+                    .handle()
+                    .insert_source(rx, |event, _, app: &mut App| {
+                        if let channel::Event::Msg(msg) = event {
+                            match msg {
+                                DbusIdleEvent::Idle => app.signal_activate = true,
+                                DbusIdleEvent::Resumed => app.signal_deactivate = true,
+                            }
+                        }
+                    })
+                    .expect("Failed to insert D-Bus channel source");
+                dbus_idle = true;
+            }
+        }
+        if !dbus_idle {
+            log::warn!("No idle detection available — use --now or --activate");
+        }
     }
 
     while app.running {
@@ -700,6 +785,10 @@ fn run(args: RunArgs) {
         if app.signal_activate {
             app.signal_activate = false;
             app.activate(&qh);
+        }
+        if app.signal_deactivate {
+            app.signal_deactivate = false;
+            app.deactivate();
         }
     }
 

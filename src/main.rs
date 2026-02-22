@@ -48,7 +48,7 @@ use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
 
 use crate::animation::Animation;
 use crate::config::Config;
-use crate::renderer::Renderer;
+use crate::renderer::{DebugInfo, Renderer};
 
 enum DbusIdleEvent {
     Idle,
@@ -100,7 +100,7 @@ fn dbus_idle_monitor_loop(tx: Sender<DbusIdleEvent>, timeout_ms: u64) {
 
         if !was_idle && idle_ms >= timeout_ms {
             if is_idle_inhibited(&session_proxy) {
-                log::info!("D-Bus: idle inhibited — skipping activation");
+                log::debug!("D-Bus: idle inhibited — skipping activation");
                 continue;
             }
             log::info!("D-Bus: user idle ({idle_ms}ms) — activating screensaver");
@@ -164,6 +164,10 @@ struct RunArgs {
     /// Edge padding in pixels
     #[arg(long)]
     edge_padding: Option<u32>,
+
+    /// Show debug overlay (frame count, timing, source)
+    #[arg(long)]
+    debug: bool,
 }
 
 struct Screensaver {
@@ -172,6 +176,7 @@ struct Screensaver {
     renderer: Option<Renderer>,
     animation: Option<Animation>,
     inhibitor: Option<ZwpIdleInhibitorV1>,
+    dbus_inhibit_cookie: Option<u32>,
     activated_at: Instant,
 }
 
@@ -195,6 +200,10 @@ struct App {
     running: bool,
     signal_activate: bool,
     signal_deactivate: bool,
+    ready_to_draw: bool,
+    last_draw: Option<Instant>,
+    debug: bool,
+    frame_count: u64,
 }
 
 impl App {
@@ -218,11 +227,38 @@ impl App {
             .as_ref()
             .map(|mgr| mgr.create_inhibitor(window.wl_surface(), qh, ()));
 
+        // D-Bus ScreenSaver inhibit as belt-and-suspenders for GNOME DPMS
+        let dbus_inhibit_cookie = dbus::blocking::Connection::new_session()
+            .ok()
+            .and_then(|conn| {
+                let proxy = conn.with_proxy(
+                    "org.freedesktop.ScreenSaver",
+                    "/org/freedesktop/ScreenSaver",
+                    std::time::Duration::from_secs(2),
+                );
+                let result: Result<(u32,), _> = proxy.method_call(
+                    "org.freedesktop.ScreenSaver",
+                    "Inhibit",
+                    ("olsvr", "Screensaver active"),
+                );
+                match result {
+                    Ok((cookie,)) => {
+                        log::info!("D-Bus ScreenSaver inhibited (cookie={cookie})");
+                        Some(cookie)
+                    }
+                    Err(e) => {
+                        log::warn!("D-Bus ScreenSaver.Inhibit failed: {e}");
+                        None
+                    }
+                }
+            });
+
         self.screensaver = Some(Screensaver {
             window,
             renderer: None,
             animation: None,
             inhibitor,
+            dbus_inhibit_cookie,
             activated_at: Instant::now(),
         });
     }
@@ -242,10 +278,42 @@ impl App {
             if let Some(inhibitor) = ss.inhibitor {
                 inhibitor.destroy();
             }
+            if let Some(cookie) = ss.dbus_inhibit_cookie
+                && let Ok(conn) = dbus::blocking::Connection::new_session()
+            {
+                let proxy = conn.with_proxy(
+                    "org.freedesktop.ScreenSaver",
+                    "/org/freedesktop/ScreenSaver",
+                    std::time::Duration::from_secs(2),
+                );
+                let _: Result<(), _> =
+                    proxy.method_call("org.freedesktop.ScreenSaver", "UnInhibit", (cookie,));
+                log::info!("D-Bus ScreenSaver uninhibited (cookie={cookie})");
+            }
         }
     }
 
-    fn draw(&mut self) {
+    fn draw(&mut self, from_callback: bool) {
+        let debug_info = if self.debug {
+            let frame_ms = self
+                .last_draw
+                .map(|t| t.elapsed().as_millis() as u64)
+                .unwrap_or(0);
+            Some(DebugInfo {
+                frame_count: self.frame_count,
+                frame_ms,
+                from_callback,
+                uptime_secs: self
+                    .screensaver
+                    .as_ref()
+                    .map(|ss| ss.activated_at.elapsed().as_secs())
+                    .unwrap_or(0),
+            })
+        } else {
+            None
+        };
+        self.frame_count += 1;
+
         if let Some(ref mut ss) = self.screensaver
             && let (Some(anim), Some(renderer)) = (&mut ss.animation, &mut ss.renderer)
         {
@@ -256,7 +324,7 @@ impl App {
                 "draw: alpha={alpha} pos=({x:.0},{y:.0}) phase={}",
                 anim.phase_name()
             );
-            renderer.render_frame(x, y, alpha);
+            renderer.render_frame(x, y, alpha, debug_info.as_ref());
         }
     }
 }
@@ -287,9 +355,8 @@ impl CompositorHandler for App {
         _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        // Rendering is driven by the main loop, not frame callbacks.
-        // This avoids permanent freezes when wgpu fails to present a buffer
-        // (e.g. after display power cycle), which would break the callback chain.
+        log::debug!("Frame callback received");
+        self.ready_to_draw = true;
     }
 
     fn surface_enter(
@@ -637,7 +704,7 @@ delegate_seat!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 
-fn pid_path() -> PathBuf {
+pub fn pid_path() -> PathBuf {
     let uid = unsafe { libc::getuid() };
     PathBuf::from(format!("/run/user/{uid}/olsvr.pid"))
 }
@@ -724,6 +791,10 @@ fn run(args: RunArgs) {
         running: true,
         signal_activate: args.now,
         signal_deactivate: false,
+        ready_to_draw: false,
+        last_draw: None,
+        debug: args.debug,
+        frame_count: 0,
     };
 
     let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("Failed to create event loop");
@@ -790,9 +861,11 @@ fn run(args: RunArgs) {
     }
 
     while app.running {
+        let t0 = Instant::now();
         event_loop
             .dispatch(std::time::Duration::from_millis(16), &mut app)
             .expect("Event loop dispatch failed");
+        let dispatch_ms = t0.elapsed().as_millis();
 
         if app.signal_activate {
             app.signal_activate = false;
@@ -803,17 +876,36 @@ fn run(args: RunArgs) {
             app.deactivate();
         }
 
-        // Timer-driven rendering: draw on every loop iteration (~60fps).
-        // This is more robust than frame callbacks, which permanently break
-        // when wgpu fails to present a buffer.
-        let surface = app
-            .screensaver
-            .as_ref()
-            .map(|ss| ss.window.wl_surface().clone());
-        if let Some(surface) = surface {
-            app.draw();
+        // Draw when the compositor signals readiness (frame callback), or
+        // after 100ms as a fallback if the callback chain breaks.
+        let should_draw = app.screensaver.is_some()
+            && (app.ready_to_draw
+                || app
+                    .last_draw
+                    .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(100)));
+        if should_draw {
+            let from_callback = app.ready_to_draw;
+            let surface = app
+                .screensaver
+                .as_ref()
+                .unwrap()
+                .window
+                .wl_surface()
+                .clone();
+            let t1 = Instant::now();
+            app.draw(from_callback);
+            let draw_ms = t1.elapsed().as_millis();
+            surface.frame(&qh, surface.clone());
             surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
             surface.commit();
+
+            if dispatch_ms > 50 || draw_ms > 50 {
+                log::warn!("Slow frame: dispatch={dispatch_ms}ms draw={draw_ms}ms");
+            }
+            app.ready_to_draw = false;
+            app.last_draw = Some(Instant::now());
+        } else if app.screensaver.is_some() && dispatch_ms > 50 {
+            log::warn!("Dispatch blocked {dispatch_ms}ms (no draw)");
         }
     }
 
@@ -865,6 +957,7 @@ fn main() {
                     hold: None,
                     fade_duration: None,
                     edge_padding: None,
+                    debug: false,
                 });
             }
         }

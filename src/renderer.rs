@@ -1,4 +1,5 @@
 use std::ptr::NonNull;
+use std::time::Instant;
 
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
@@ -11,6 +12,13 @@ use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Proxy};
 
 use crate::config::Config;
+
+pub struct DebugInfo {
+    pub frame_count: u64,
+    pub frame_ms: u64,
+    pub from_callback: bool,
+    pub uptime_secs: u64,
+}
 
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
@@ -26,6 +34,7 @@ pub struct Renderer {
     viewport: Viewport,
     time_buffer: Buffer,
     date_buffer: Buffer,
+    debug_buffer: Buffer,
     font_size: f32,
     font_family: String,
     time_format: String,
@@ -76,12 +85,20 @@ impl Renderer {
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
 
+        let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
+            log::info!("Using Mailbox present mode (non-blocking)");
+            wgpu::PresentMode::Mailbox
+        } else {
+            log::info!("Mailbox not available, falling back to Fifo");
+            wgpu::PresentMode::Fifo
+        };
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
             width,
             height,
-            present_mode: wgpu::PresentMode::Fifo,
+            present_mode,
             alpha_mode: caps.alpha_modes[0],
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
@@ -135,6 +152,19 @@ impl Renderer {
         }
         date_buffer.shape_until_scroll(&mut font_system, false);
 
+        let debug_fs = 14.0;
+        let mut debug_buffer =
+            Buffer::new(&mut font_system, Metrics::new(debug_fs, debug_fs * 1.4));
+        debug_buffer.set_size(&mut font_system, Some(500.0), Some(debug_fs * 2.0));
+        debug_buffer.set_text(
+            &mut font_system,
+            "",
+            &Attrs::new().family(Family::Monospace),
+            Shaping::Advanced,
+            None,
+        );
+        debug_buffer.shape_until_scroll(&mut font_system, false);
+
         Self {
             surface,
             device,
@@ -148,6 +178,7 @@ impl Renderer {
             viewport,
             time_buffer,
             date_buffer,
+            debug_buffer,
             font_size: fs,
             font_family: app_config.font_family.clone(),
             time_format: app_config.time_format.clone(),
@@ -162,7 +193,7 @@ impl Renderer {
         self.surface.configure(&self.device, &self.config);
     }
 
-    pub fn render_frame(&mut self, x: f32, y: f32, alpha: u8) {
+    pub fn render_frame(&mut self, x: f32, y: f32, alpha: u8, debug: Option<&DebugInfo>) {
         let now = chrono::Local::now();
         let time_fmt = match self.time_format.as_str() {
             "12h" => "%I:%M %p",
@@ -213,6 +244,25 @@ impl Renderer {
 
         let date_y = y + self.font_size * 1.2;
 
+        if let Some(dbg) = debug {
+            let src = if dbg.from_callback { "cb" } else { "fb" };
+            let mins = dbg.uptime_secs / 60;
+            let secs = dbg.uptime_secs % 60;
+            let debug_text = format!(
+                "#{} {}ms {} {mins}:{secs:02}",
+                dbg.frame_count, dbg.frame_ms, src
+            );
+            self.debug_buffer.set_text(
+                &mut self.font_system,
+                &debug_text,
+                &Attrs::new().family(Family::Monospace),
+                Shaping::Advanced,
+                None,
+            );
+            self.debug_buffer
+                .shape_until_scroll(&mut self.font_system, false);
+        }
+
         self.viewport.update(
             &self.queue,
             Resolution {
@@ -221,7 +271,7 @@ impl Renderer {
             },
         );
 
-        let text_areas = [
+        let mut text_areas = vec![
             TextArea {
                 buffer: &self.time_buffer,
                 left: x,
@@ -252,6 +302,23 @@ impl Renderer {
             },
         ];
 
+        if debug.is_some() {
+            text_areas.push(TextArea {
+                buffer: &self.debug_buffer,
+                left: 10.0,
+                top: h as f32 - 30.0,
+                scale: 1.0,
+                bounds: TextBounds {
+                    left: 0,
+                    top: 0,
+                    right: w as i32,
+                    bottom: h as i32,
+                },
+                default_color: Color::rgba(100, 100, 100, 200),
+                custom_glyphs: &[],
+            });
+        }
+
         self.text_renderer
             .prepare(
                 &self.device,
@@ -264,6 +331,7 @@ impl Renderer {
             )
             .expect("Failed to prepare text");
 
+        let t0 = Instant::now();
         let output = match self.surface.get_current_texture() {
             Ok(t) => t,
             Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
@@ -276,11 +344,17 @@ impl Renderer {
                     }
                 }
             }
+            Err(wgpu::SurfaceError::Timeout) => {
+                log::warn!("Surface texture timed out — skipping frame");
+                return;
+            }
             Err(e) => {
                 log::warn!("Failed to get surface texture: {e}");
                 return;
             }
         };
+        let texture_ms = t0.elapsed().as_millis();
+
         let view = output.texture.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         {
@@ -301,8 +375,20 @@ impl Renderer {
                 .render(&self.text_atlas, &self.viewport, &mut pass)
                 .expect("Failed to render text");
         }
+
+        let t1 = Instant::now();
         self.queue.submit(Some(encoder.finish()));
+        let submit_ms = t1.elapsed().as_millis();
+
+        let t2 = Instant::now();
         output.present();
+        let present_ms = t2.elapsed().as_millis();
+
+        if texture_ms > 50 || submit_ms > 50 || present_ms > 50 {
+            log::warn!(
+                "Render: texture={texture_ms}ms submit={submit_ms}ms present={present_ms}ms"
+            );
+        }
 
         self.text_atlas.trim();
     }

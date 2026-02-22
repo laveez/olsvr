@@ -3,6 +3,23 @@ use std::process::Command;
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 
 use crate::config::Config;
+use crate::pid_path;
+
+fn stop_existing() {
+    // Stop systemd service if running
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", "olsvr.service"])
+        .output();
+
+    // Kill any process from the PID file
+    let path = pid_path();
+    if let Ok(contents) = std::fs::read_to_string(&path)
+        && let Ok(pid) = contents.trim().parse::<i32>()
+    {
+        unsafe { libc::kill(pid, libc::SIGTERM) };
+        let _ = std::fs::remove_file(&path);
+    }
+}
 
 pub fn run() {
     let theme = ColorfulTheme::default();
@@ -11,6 +28,8 @@ pub fn run() {
     println!("  olsvr setup");
     println!("  OLED screensaver for Wayland");
     println!();
+
+    stop_existing();
 
     // Check prerequisites
     if std::env::var("WAYLAND_DISPLAY").is_err() {
@@ -239,12 +258,15 @@ fn install_systemd_service() {
 
     println!("  Installed service to {service_path}");
 
-    // Reload and enable
+    // Reload, enable, and (re)start
     let _ = Command::new("systemctl")
         .args(["--user", "daemon-reload"])
         .status();
     let _ = Command::new("systemctl")
-        .args(["--user", "enable", "--now", "olsvr.service"])
+        .args(["--user", "enable", "olsvr.service"])
+        .status();
+    let _ = Command::new("systemctl")
+        .args(["--user", "restart", "olsvr.service"])
         .status();
 
     println!("  Service enabled and started.");

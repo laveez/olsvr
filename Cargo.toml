@@ -26,5 +26,7 @@ serde = { version = "1", features = ["derive"] }
 toml = "1.0"
 dialoguer = "0.12"
 dbus = "0.9"
+ureq = "3"
+quick-xml = "0.37"
 log = "0.4"
 env_logger = "0.11"

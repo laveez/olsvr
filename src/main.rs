@@ -1,10 +1,14 @@
 mod animation;
+mod compositor;
 mod config;
-mod renderer;
+mod data;
+mod layer;
+mod layers;
 mod setup;
 
 use std::num::NonZeroU32;
 use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
@@ -46,9 +50,9 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
 
 use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
 
-use crate::animation::Animation;
+use crate::compositor::{Compositor, DebugInfo};
 use crate::config::Config;
-use crate::renderer::{DebugInfo, Renderer};
+use crate::data::DataCache;
 
 enum DbusIdleEvent {
     Idle,
@@ -173,8 +177,7 @@ struct RunArgs {
 struct Screensaver {
     #[allow(dead_code)]
     window: Window,
-    renderer: Option<Renderer>,
-    animation: Option<Animation>,
+    compositor: Option<Compositor>,
     inhibitor: Option<ZwpIdleInhibitorV1>,
     dbus_inhibit_cookie: Option<u32>,
     activated_at: Instant,
@@ -195,6 +198,7 @@ struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     config: Config,
+    data_cache: Arc<RwLock<DataCache>>,
     width: u32,
     height: u32,
     running: bool,
@@ -253,10 +257,18 @@ impl App {
                 }
             });
 
+        // Start weather fetch thread if a weather layer is configured
+        if let Some((location, interval_secs)) = self.config.weather_config() {
+            data::start_fetch_thread(
+                self.data_cache.clone(),
+                location,
+                std::time::Duration::from_secs(interval_secs),
+            );
+        }
+
         self.screensaver = Some(Screensaver {
             window,
-            renderer: None,
-            animation: None,
+            compositor: None,
             inhibitor,
             dbus_inhibit_cookie,
             activated_at: Instant::now(),
@@ -315,16 +327,9 @@ impl App {
         self.frame_count += 1;
 
         if let Some(ref mut ss) = self.screensaver
-            && let (Some(anim), Some(renderer)) = (&mut ss.animation, &mut ss.renderer)
+            && let Some(ref mut comp) = ss.compositor
         {
-            anim.tick();
-            let (x, y) = anim.position();
-            let alpha = anim.alpha();
-            log::trace!(
-                "draw: alpha={alpha} pos=({x:.0},{y:.0}) phase={}",
-                anim.phase_name()
-            );
-            renderer.render_frame(x, y, alpha, debug_info.as_ref());
+            comp.render_frame(debug_info.as_ref());
         }
     }
 }
@@ -509,30 +514,21 @@ impl WindowHandler for App {
                 return;
             }
 
-            if ss.renderer.is_none() {
-                log::info!("Window configured: {w}x{h}, initializing renderer");
-                let renderer = Renderer::new(&self.conn, window.wl_surface(), w, h, &self.config);
-                let animation = Animation::new(
-                    w as f32,
-                    h as f32,
-                    renderer.text_block_width(),
-                    renderer.text_block_height(),
-                    self.config.hold,
-                    self.config.fade_duration,
-                    self.config.edge_padding,
+            if ss.compositor.is_none() {
+                log::info!("Window configured: {w}x{h}, initializing compositor");
+                let (layer_list, layer_configs) = self.config.build_layers(self.debug);
+                let comp = Compositor::new(
+                    &self.conn,
+                    window.wl_surface(),
+                    w,
+                    h,
+                    layer_list,
+                    &layer_configs,
+                    self.data_cache.clone(),
                 );
-                ss.renderer = Some(renderer);
-                ss.animation = Some(animation);
-            } else if let Some(ref mut renderer) = ss.renderer {
-                renderer.resize(w, h);
-                if let Some(ref mut anim) = ss.animation {
-                    anim.update_screen_size(
-                        w as f32,
-                        h as f32,
-                        renderer.text_block_width(),
-                        renderer.text_block_height(),
-                    );
-                }
+                ss.compositor = Some(comp);
+            } else if let Some(ref mut comp) = ss.compositor {
+                comp.resize(w, h);
             }
         }
     }
@@ -771,6 +767,8 @@ fn run(args: RunArgs) {
         log::warn!("zwp_idle_inhibit_manager_v1 not available — idle inhibition disabled");
     }
 
+    let data_cache = Arc::new(RwLock::new(DataCache::default()));
+
     let mut app = App {
         conn: conn.clone(),
         registry_state: RegistryState::new(&globals),
@@ -786,6 +784,7 @@ fn run(args: RunArgs) {
         keyboard: None,
         pointer: None,
         config,
+        data_cache,
         width: 0,
         height: 0,
         running: true,

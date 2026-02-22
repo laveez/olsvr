@@ -62,6 +62,14 @@ fn get_mutter_idletime(proxy: &dbus::blocking::Proxy<&dbus::blocking::Connection
         .map(|(ms,): (u64,)| ms)
 }
 
+fn is_idle_inhibited(proxy: &dbus::blocking::Proxy<&dbus::blocking::Connection>) -> bool {
+    proxy
+        .method_call("org.gnome.SessionManager", "IsInhibited", (8u32,))
+        .ok()
+        .map(|(inhibited,): (bool,)| inhibited)
+        .unwrap_or(false)
+}
+
 fn dbus_idle_monitor_loop(tx: Sender<DbusIdleEvent>, timeout_ms: u64) {
     let conn = match dbus::blocking::Connection::new_session() {
         Ok(c) => c,
@@ -70,9 +78,14 @@ fn dbus_idle_monitor_loop(tx: Sender<DbusIdleEvent>, timeout_ms: u64) {
             return;
         }
     };
-    let proxy = conn.with_proxy(
+    let idle_proxy = conn.with_proxy(
         "org.gnome.Mutter.IdleMonitor",
         "/org/gnome/Mutter/IdleMonitor/Core",
+        std::time::Duration::from_secs(2),
+    );
+    let session_proxy = conn.with_proxy(
+        "org.gnome.SessionManager",
+        "/org/gnome/SessionManager",
         std::time::Duration::from_secs(2),
     );
 
@@ -80,12 +93,16 @@ fn dbus_idle_monitor_loop(tx: Sender<DbusIdleEvent>, timeout_ms: u64) {
     loop {
         std::thread::sleep(std::time::Duration::from_secs(1));
 
-        let Some(idle_ms) = get_mutter_idletime(&proxy) else {
+        let Some(idle_ms) = get_mutter_idletime(&idle_proxy) else {
             log::error!("GetIdletime call failed — stopping D-Bus monitor");
             return;
         };
 
         if !was_idle && idle_ms >= timeout_ms {
+            if is_idle_inhibited(&session_proxy) {
+                log::info!("D-Bus: idle inhibited — skipping activation");
+                continue;
+            }
             log::info!("D-Bus: user idle ({idle_ms}ms) — activating screensaver");
             if tx.send(DbusIdleEvent::Idle).is_err() {
                 return;
@@ -266,13 +283,13 @@ impl CompositorHandler for App {
     fn frame(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
-        surface: &wl_surface::WlSurface,
+        _qh: &QueueHandle<Self>,
+        _surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
-        surface.frame(qh, surface.clone());
-        self.draw();
-        surface.commit();
+        // Rendering is driven by the main loop, not frame callbacks.
+        // This avoids permanent freezes when wgpu fails to present a buffer
+        // (e.g. after display power cycle), which would break the callback chain.
     }
 
     fn surface_enter(
@@ -402,7 +419,7 @@ impl WindowHandler for App {
     fn configure(
         &mut self,
         _conn: &Connection,
-        qh: &QueueHandle<Self>,
+        _qh: &QueueHandle<Self>,
         window: &Window,
         configure: WindowConfigure,
         _serial: u32,
@@ -439,11 +456,6 @@ impl WindowHandler for App {
                 );
                 ss.renderer = Some(renderer);
                 ss.animation = Some(animation);
-
-                let wl_surface = window.wl_surface();
-                wl_surface.frame(qh, wl_surface.clone());
-                self.draw();
-                wl_surface.commit();
             } else if let Some(ref mut renderer) = ss.renderer {
                 renderer.resize(w, h);
                 if let Some(ref mut anim) = ss.animation {
@@ -789,6 +801,19 @@ fn run(args: RunArgs) {
         if app.signal_deactivate {
             app.signal_deactivate = false;
             app.deactivate();
+        }
+
+        // Timer-driven rendering: draw on every loop iteration (~60fps).
+        // This is more robust than frame callbacks, which permanently break
+        // when wgpu fails to present a buffer.
+        let surface = app
+            .screensaver
+            .as_ref()
+            .map(|ss| ss.window.wl_surface().clone());
+        if let Some(surface) = surface {
+            app.draw();
+            surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+            surface.commit();
         }
     }
 

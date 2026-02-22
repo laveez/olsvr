@@ -34,6 +34,7 @@ olsvr prevents OLED burn-in by displaying a fading clock that periodically repos
 - **systemd integration** — setup wizard can install and enable a user service
 - **Manual trigger** — `olsvr run --activate` sends SIGUSR1 to a running instance
 - **Idle inhibitor** — prevents the system from sleeping while the screensaver is active
+- **Video-aware** — respects screensaver inhibitors (e.g. video playback) on both Wayland and GNOME D-Bus paths
 - **Input dismissal** — any key press or mouse movement deactivates immediately
 
 ---

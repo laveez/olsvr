@@ -5,7 +5,9 @@ edition = "2024"
 description = "OLED screensaver for Wayland"
 license = "MIT"
 repository = "https://github.com/laveez/olsvr"
-keywords = ["wayland", "screensaver", "oled", "rust"]
+homepage = "https://github.com/laveez/olsvr"
+readme = "README.md"
+keywords = ["wayland", "screensaver", "oled", "burn-in"]
 categories = ["command-line-utilities"]
 
 [dependencies]

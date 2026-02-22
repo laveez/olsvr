@@ -28,14 +28,14 @@ olsvr prevents OLED burn-in by displaying a fading clock that periodically repos
 - **Idle detection** — activates via `ext-idle-notify-v1` or D-Bus (GNOME) after configurable timeout
 - **Fade animation** — clock fades in, holds, fades out, then teleports to a new position
 - **Quadrant-aware repositioning** — never lands in the same screen quadrant twice in a row
-- **Weather overlay** — colored Nerd Font weather icons with temperature and wind speed via FMI open data
+- **Weather overlay** — colored Nerd Font weather icons with temperature and wind speed via [FMI Open Data](https://en.ilmatieteenlaitos.fi/open-data)
 - **GPU-accelerated** — wgpu + glyphon text rendering on Vulkan
 - **Configurable** — font, size, color, timing, date/time format via `~/.olsvr.toml`
 - **Interactive setup wizard** — `olsvr setup` walks through configuration with live preview
 - **systemd integration** — setup wizard can install and enable a user service
 - **Manual trigger** — `olsvr run --activate` sends SIGUSR1 to a running instance
 - **Idle inhibitor** — prevents the system from sleeping while the screensaver is active
-- **Video-aware** — respects screensaver inhibitors (e.g. video playback) on both Wayland and GNOME D-Bus paths
+- **Video-aware** — respects screensaver inhibitors (e.g. video playback) on both Wayland and D-Bus paths
 - **Input dismissal** — any key press or mouse movement deactivates immediately
 
 ---
@@ -82,7 +82,7 @@ The wizard writes `~/.olsvr.toml` and can be re-run at any time to adjust settin
 
 Settings live in `~/.olsvr.toml`. All fields are optional — defaults are used for anything omitted. The setup wizard (`olsvr setup`) is the easiest way to configure everything.
 
-### Clock settings
+### Clock
 
 | Field | Description | Default |
 |---|---|---|
@@ -96,9 +96,9 @@ Settings live in `~/.olsvr.toml`. All fields are optional — defaults are used 
 | `color` | RGB brightness `[r, g, b]` | `[255, 255, 255]` |
 | `edge_padding` | Minimum distance from screen edges (pixels) | `50` |
 
-### Weather layer
+### Weather
 
-The weather overlay displays a colored icon, temperature, and wind speed below the clock using [FMI Open Data](https://en.ilmatieteenlaitos.fi/open-data). Icons use Nerd Font weather glyphs — install a [Nerd Font](https://www.nerdfonts.com/) with weather icons (e.g. MesloLGS NF).
+The weather overlay shows a colored icon, temperature, and wind speed below the clock using [FMI Open Data](https://en.ilmatieteenlaitos.fi/open-data). Icons are Nerd Font weather glyphs — install a [Nerd Font](https://www.nerdfonts.com/) with weather icons (e.g. MesloLGS NF).
 
 | Field | Description | Default |
 |---|---|---|
@@ -107,7 +107,7 @@ The weather overlay displays a colored icon, temperature, and wind speed below t
 | `font_size` | Weather text size (pixels) | `28` |
 | `icon_font` | Nerd Font family for weather icons | `MesloLGS NF` |
 
-### Example config
+### Example
 
 ```toml
 timeout = 5
@@ -131,11 +131,20 @@ font_size = 28
 icon_font = "MesloLGS NF"
 ```
 
-CLI flags override config file values:
+### CLI flags
 
-```bash
-olsvr run --timeout 10 --font-size 150 --hold 15 --fade-duration 2000 --edge-padding 80
-```
+CLI flags override config file values for the current run.
+
+| Flag | Description |
+|---|---|
+| `--timeout <MINUTES>` | Idle timeout before activation |
+| `--font-size <PIXELS>` | Clock font size |
+| `--hold <SECONDS>` | Hold duration between fades |
+| `--fade-duration <MS>` | Fade in/out duration |
+| `--edge-padding <PIXELS>` | Minimum distance from screen edges |
+| `--now` | Show immediately, skip idle wait |
+| `--activate` | Send SIGUSR1 to a running instance |
+| `--debug` | Show debug overlay (frame count, timing) |
 
 ---
 
@@ -178,16 +187,16 @@ The screensaver creates a fullscreen Wayland window with a pure black background
 
 ## Contributing
 
-Contributions are welcome! This is a small project — open an issue or submit a PR.
+Contributions are welcome! Open an issue or submit a PR.
 
 ```bash
 git clone https://github.com/laveez/olsvr.git
 cd olsvr
 git config core.hooksPath .githooks  # Enable pre-push fmt/clippy checks
 cargo build
-cargo run -- run              # Run the screensaver
-cargo run -- run --activate   # Trigger a running instance
-RUST_LOG=info cargo run -- run  # With debug logging
+cargo run -- run --now               # Preview the screensaver
+cargo run -- run --now --debug       # Preview with debug overlay
+RUST_LOG=info cargo run -- run       # Run with logging
 ```
 
 ## License

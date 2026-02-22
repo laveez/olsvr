@@ -873,7 +873,17 @@ fn run(args: RunArgs) {
         }
         if app.signal_deactivate {
             app.signal_deactivate = false;
-            app.deactivate();
+            // Grace period: ignore D-Bus resume if screensaver just activated
+            // (creating the window resets Mutter's idle timer)
+            let recent = app
+                .screensaver
+                .as_ref()
+                .is_some_and(|ss| ss.activated_at.elapsed() < std::time::Duration::from_secs(5));
+            if recent {
+                log::info!("Ignoring D-Bus resume — screensaver activated <5s ago");
+            } else {
+                app.deactivate();
+            }
         }
 
         // Draw when the compositor signals readiness (frame callback), or

@@ -142,6 +142,7 @@ Contributions are welcome! This is a small project — open an issue or submit a
 ```bash
 git clone https://github.com/laveez/olsvr.git
 cd olsvr
+git config core.hooksPath .githooks  # Enable pre-push fmt/clippy checks
 cargo build
 cargo run -- run              # Run the screensaver
 cargo run -- run --activate   # Trigger a running instance

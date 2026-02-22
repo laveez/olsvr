@@ -2,8 +2,7 @@ use std::ptr::NonNull;
 
 use glyphon::{
     Attrs, Buffer, Cache, Color, Family, FontSystem, Metrics, Resolution, Shaping, SwashCache,
-    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport,
-    cosmic_text::Align,
+    TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, cosmic_text::Align,
 };
 use raw_window_handle::{
     RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,

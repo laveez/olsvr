@@ -48,7 +48,7 @@ impl Compositor {
     ) -> Self {
         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
-            ..Default::default()
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
         let display_ptr = conn.backend().display_ptr();
@@ -208,23 +208,25 @@ impl Compositor {
         // 5. Get surface texture
         let t0 = Instant::now();
         let output = match self.surface.get_current_texture() {
-            Ok(t) => t,
-            Err(wgpu::SurfaceError::Outdated | wgpu::SurfaceError::Lost) => {
+            wgpu::CurrentSurfaceTexture::Success(t) => t,
+            wgpu::CurrentSurfaceTexture::Outdated
+            | wgpu::CurrentSurfaceTexture::Suboptimal(_)
+            | wgpu::CurrentSurfaceTexture::Lost => {
                 self.surface.configure(&self.device, &self.config);
                 match self.surface.get_current_texture() {
-                    Ok(t) => t,
-                    Err(e) => {
-                        log::warn!("Failed to get surface texture after reconfigure: {e}");
+                    wgpu::CurrentSurfaceTexture::Success(t) => t,
+                    other => {
+                        log::warn!("Failed to get surface texture after reconfigure: {other:?}");
                         return;
                     }
                 }
             }
-            Err(wgpu::SurfaceError::Timeout) => {
-                log::warn!("Surface texture timed out — skipping frame");
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                log::warn!("Surface texture timeout or occluded, skipping frame");
                 return;
             }
-            Err(e) => {
-                log::warn!("Failed to get surface texture: {e}");
+            wgpu::CurrentSurfaceTexture::Validation => {
+                log::warn!("Surface texture validation error, skipping frame");
                 return;
             }
         };

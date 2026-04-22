@@ -72,7 +72,7 @@ fn parse_fmi_xml(xml: &str) -> Result<(f32, u8, f32), String> {
                 }
             }
             Ok(Event::Text(e)) => {
-                let text = e.unescape().unwrap_or_default().trim().to_string();
+                let text = e.xml_content().unwrap_or_default().trim().to_string();
                 if in_param_name {
                     current_param = text;
                     in_param_name = false;

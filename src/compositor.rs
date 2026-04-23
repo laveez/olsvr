@@ -46,7 +46,7 @@ impl Compositor {
         layer_configs: &[toml::value::Table],
         data_cache: Arc<RwLock<DataCache>>,
     ) -> Self {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
@@ -56,9 +56,9 @@ impl Compositor {
 
         let surface = unsafe {
             instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+                raw_display_handle: Some(RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
                     NonNull::new_unchecked(display_ptr as *mut _),
-                )),
+                ))),
                 raw_window_handle: RawWindowHandle::Wayland(WaylandWindowHandle::new(
                     NonNull::new_unchecked(surface_ptr as *mut _),
                 )),

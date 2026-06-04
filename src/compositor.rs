@@ -38,6 +38,21 @@ pub struct Compositor {
     layers: Vec<Box<dyn Layer>>,
     last_frame: Instant,
     data_cache: Arc<RwLock<DataCache>>,
+    max_texture_dim: u32,
+}
+
+/// Scale `(w, h)` down proportionally so neither exceeds `max` (the GPU's max
+/// texture dimension). Returns at least 1x1; aspect ratio is preserved.
+fn clamp_to_max(w: u32, h: u32, max: u32) -> (u32, u32) {
+    let longest = w.max(h);
+    if longest <= max {
+        return (w.max(1), h.max(1));
+    }
+    let scale = max as f64 / longest as f64;
+    (
+        ((w as f64 * scale) as u32).clamp(1, max),
+        ((h as f64 * scale) as u32).clamp(1, max),
+    )
 }
 
 impl Compositor {
@@ -61,9 +76,18 @@ impl Compositor {
 
         let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("olsvr"),
+            // Use the adapter's real limits so large HiDPI surfaces (e.g. a 2x
+            // 5120x1440 panel = 10240x2880) fit; the default caps texture size at 8192.
+            required_limits: adapter.limits(),
             ..Default::default()
         }))
         .expect("Failed to create device");
+
+        // Some displays report a physical (HiDPI) size larger than the GPU's max
+        // texture dimension; clamp the surface so configure() can't fail. The
+        // presented image is scaled to fill the window.
+        let max_texture_dim = adapter.limits().max_texture_dimension_2d;
+        let (width, height) = clamp_to_max(width, height, max_texture_dim);
 
         let caps = surface.get_capabilities(&adapter);
         let format = caps.formats[0];
@@ -126,6 +150,7 @@ impl Compositor {
             layers,
             last_frame: Instant::now(),
             data_cache,
+            max_texture_dim,
         }
     }
 
@@ -173,6 +198,7 @@ impl Compositor {
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
+        let (width, height) = clamp_to_max(width, height, self.max_texture_dim);
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);

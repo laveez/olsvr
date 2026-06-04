@@ -47,6 +47,7 @@ use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
 use crate::compositor::{Compositor, DebugInfo};
 use crate::config::Config;
 use crate::data::{self, DataCache};
+use crate::engine::{BackendEvent, Engine, EngineCommand};
 use crate::{RunArgs, merge_cli, pid_path};
 
 enum DbusIdleEvent {
@@ -141,6 +142,7 @@ struct App {
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
     config: Config,
+    engine: Engine,
     data_cache: Arc<RwLock<DataCache>>,
     width: u32,
     height: u32,
@@ -218,13 +220,27 @@ impl App {
         });
     }
 
-    fn dismiss(&mut self) {
-        if let Some(ref ss) = self.screensaver
-            && ss.activated_at.elapsed() < std::time::Duration::from_secs(1)
-        {
-            return;
+    /// Execute the commands the `Engine` produced for an event.
+    fn apply(&mut self, cmds: Vec<EngineCommand>, qh: &QueueHandle<Self>) {
+        for cmd in cmds {
+            match cmd {
+                EngineCommand::Show { .. } => self.activate(qh),
+                EngineCommand::Hide => self.deactivate(),
+                // On Wayland the idle inhibitor is tied to the screensaver
+                // surface, so keep-awake is handled inside activate/deactivate.
+                EngineCommand::SetKeepAwake(_) => {}
+                EngineCommand::Quit => self.running = false,
+            }
         }
-        self.deactivate();
+    }
+
+    fn on_event(&mut self, ev: BackendEvent, qh: &QueueHandle<Self>) {
+        let cmds = self.engine.handle(ev, Instant::now());
+        self.apply(cmds, qh);
+    }
+
+    fn dismiss(&mut self, qh: &QueueHandle<Self>) {
+        self.on_event(BackendEvent::DismissInput, qh);
     }
 
     fn deactivate(&mut self) {
@@ -503,12 +519,12 @@ impl KeyboardHandler for App {
     fn press_key(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         _keyboard: &wl_keyboard::WlKeyboard,
         _serial: u32,
         _event: KeyEvent,
     ) {
-        self.dismiss();
+        self.dismiss(qh);
     }
 
     fn repeat_key(
@@ -548,7 +564,7 @@ impl PointerHandler for App {
     fn pointer_frame(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         pointer: &wl_pointer::WlPointer,
         events: &[PointerEvent],
     ) {
@@ -559,7 +575,7 @@ impl PointerHandler for App {
                 }
                 PointerEventKind::Leave { .. } => {}
                 _ => {
-                    self.dismiss();
+                    self.dismiss(qh);
                     return;
                 }
             }
@@ -579,11 +595,11 @@ impl Dispatch<ExtIdleNotificationV1, ()> for App {
         match event {
             ext_idle_notification_v1::Event::Idled => {
                 log::info!("User idle — activating screensaver");
-                state.activate(qh);
+                state.on_event(BackendEvent::Idle, qh);
             }
             ext_idle_notification_v1::Event::Resumed => {
                 log::info!("User resumed — deactivating screensaver");
-                state.deactivate();
+                state.on_event(BackendEvent::Resume, qh);
             }
             _ => {}
         }
@@ -689,6 +705,11 @@ pub fn run(args: RunArgs) {
 
     let data_cache = Arc::new(RwLock::new(DataCache::default()));
 
+    // The Engine owns the activate/deactivate decisions and grace periods. On
+    // Wayland a single fullscreen surface is used regardless of the display set,
+    // so a one-element display list is sufficient.
+    let engine = Engine::new(config.activation, vec![0]);
+
     let mut app = App {
         conn: conn.clone(),
         registry_state: RegistryState::new(&globals),
@@ -704,6 +725,7 @@ pub fn run(args: RunArgs) {
         keyboard: None,
         pointer: None,
         config,
+        engine,
         data_cache,
         width: 0,
         height: 0,
@@ -779,6 +801,10 @@ pub fn run(args: RunArgs) {
         }
     }
 
+    // Apply any startup commands (e.g. hold keep-awake under the "always" policy).
+    let init_cmds = app.engine.init();
+    app.apply(init_cmds, &qh);
+
     while app.running {
         let t0 = Instant::now();
         event_loop
@@ -788,21 +814,12 @@ pub fn run(args: RunArgs) {
 
         if app.signal_activate {
             app.signal_activate = false;
-            app.activate(&qh);
+            app.on_event(BackendEvent::ActivateSignal, &qh);
         }
         if app.signal_deactivate {
             app.signal_deactivate = false;
-            // Grace period: ignore D-Bus resume if screensaver just activated
-            // (creating the window resets Mutter's idle timer)
-            let recent = app
-                .screensaver
-                .as_ref()
-                .is_some_and(|ss| ss.activated_at.elapsed() < std::time::Duration::from_secs(5));
-            if recent {
-                log::info!("Ignoring D-Bus resume — screensaver activated <5s ago");
-            } else {
-                app.deactivate();
-            }
+            // The Engine owns the resume grace period now.
+            app.on_event(BackendEvent::Resume, &qh);
         }
 
         // Draw when the compositor signals readiness (frame callback), or

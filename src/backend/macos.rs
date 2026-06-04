@@ -8,12 +8,12 @@ use std::time::{Duration, Instant};
 
 use core_foundation::base::TCFType;
 use core_foundation::string::{CFString, CFStringRef};
-use objc2_app_kit::{NSCursor, NSView, NSWindowCollectionBehavior};
+use objc2_app_kit::{NSColor, NSCursor, NSView, NSWindowCollectionBehavior};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
+use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::RunArgs;
 use crate::compositor::Compositor;
@@ -67,9 +67,16 @@ fn release_keep_awake(id: u32) {
     }
 }
 
-/// Raise a winit window to the macOS screen-saver level and make it span all
-/// Spaces / show over fullscreen apps, via the underlying NSWindow. Best-effort.
-fn raise_to_screensaver_level(window: &Window) {
+/// Make a winit window a full-display screen-saver overlay via the underlying
+/// NSWindow: screen-saver level (draws over the menu bar and Dock), visible on
+/// all Spaces, and sized to the exact screen frame.
+///
+/// We size the window ourselves instead of using winit's `Fullscreen::Borderless`
+/// because that relies on hiding the menu bar through presentation options, which
+/// an `LSUIElement` accessory app can't do — so its fullscreen silently downgrades
+/// to a partial window. At screen-saver level the overlay simply draws over the
+/// menu bar and Dock, so the app's activation policy no longer matters.
+fn configure_saver_window(window: &Window) {
     let Ok(handle) = window.window_handle() else {
         return;
     };
@@ -86,6 +93,23 @@ fn raise_to_screensaver_level(window: &Window) {
                     | NSWindowCollectionBehavior::Stationary
                     | NSWindowCollectionBehavior::FullScreenAuxiliary,
             );
+            // Cover the whole display, menu-bar region included. Overscan a
+            // couple points beyond the screen frame so HiDPI rounding can't leave
+            // a 1px seam at the edges; the excess is clipped off-screen.
+            if let Some(screen) = ns_window.screen() {
+                let mut frame = screen.frame();
+                frame.origin.x -= 2.0;
+                frame.origin.y -= 2.0;
+                frame.size.width += 4.0;
+                frame.size.height += 4.0;
+                ns_window.setFrame_display(frame, true);
+            }
+            // Paint the window itself black (and drop the shadow) so nothing grey
+            // can show at the edges even if the GPU surface doesn't perfectly cover.
+            ns_window.setOpaque(true);
+            ns_window.setHasShadow(false);
+            ns_window.setBackgroundColor(Some(&*NSColor::blackColor()));
+            ns_window.orderFrontRegardless();
         }
     }
 }
@@ -212,16 +236,22 @@ impl MacApp {
         }
 
         for monitor in monitors {
+            // Borderless window placed on this monitor; configure_saver_window
+            // then snaps it to the exact screen frame at screen-saver level.
+            // (Not winit's Fullscreen::Borderless — an LSUIElement accessory app
+            // can't drive that correctly.)
             let attrs = Window::default_attributes()
                 .with_title("olsvr")
-                .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+                .with_decorations(false)
+                .with_position(monitor.position())
+                .with_inner_size(monitor.size());
             let window = Arc::new(
                 event_loop
                     .create_window(attrs)
                     .expect("failed to create window"),
             );
             window.set_window_level(WindowLevel::AlwaysOnTop);
-            raise_to_screensaver_level(&window);
+            configure_saver_window(&window);
 
             let size = window.inner_size();
             let surface = instance

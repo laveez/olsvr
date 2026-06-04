@@ -70,9 +70,20 @@ pub(crate) struct RunArgs {
     pub debug: bool,
 }
 
+/// launchd agent label (and plist filename stem) on macOS.
+#[cfg(target_os = "macos")]
+pub(crate) const LAUNCHD_LABEL: &str = "io.github.laveez.olsvr";
+
+#[cfg(target_os = "linux")]
 pub(crate) fn pid_path() -> PathBuf {
     let uid = unsafe { libc::getuid() };
     PathBuf::from(format!("/run/user/{uid}/olsvr.pid"))
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn pid_path() -> PathBuf {
+    // $TMPDIR is a per-user directory on macOS (no /run/user equivalent).
+    std::env::temp_dir().join("olsvr.pid")
 }
 
 pub(crate) fn merge_cli(config: &mut Config, args: &RunArgs) {
@@ -93,24 +104,46 @@ pub(crate) fn merge_cli(config: &mut Config, args: &RunArgs) {
     }
 }
 
-fn stop() {
+/// SIGTERM the PID recorded in the pidfile, if present. Returns the PID signaled.
+fn kill_pidfile() -> Option<i32> {
     let path = pid_path();
-    match std::fs::read_to_string(&path) {
-        Ok(contents) => match contents.trim().parse::<i32>() {
-            Ok(pid) => {
-                unsafe { libc::kill(pid, libc::SIGTERM) };
-                println!("Stopped olsvr (PID {pid})");
-                let _ = std::fs::remove_file(&path);
-            }
-            Err(_) => {
-                eprintln!("Invalid PID file at {}", path.display());
-                std::process::exit(1);
-            }
-        },
-        Err(_) => {
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let Ok(pid) = contents.trim().parse::<i32>() else {
+        eprintln!("Invalid PID file at {}", path.display());
+        return None;
+    };
+    unsafe { libc::kill(pid, libc::SIGTERM) };
+    let _ = std::fs::remove_file(&path);
+    Some(pid)
+}
+
+#[cfg(target_os = "linux")]
+fn stop() {
+    match kill_pidfile() {
+        Some(pid) => println!("Stopped olsvr (PID {pid})"),
+        None => {
             eprintln!("No running olsvr instance found");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn stop() {
+    // Boot out the launchd agent first so KeepAlive can't restart it, then also
+    // kill a foreground instance via its pidfile. Either succeeding = stopped.
+    let uid = unsafe { libc::getuid() };
+    let booted_out = std::process::Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let killed = kill_pidfile().is_some();
+    if booted_out || killed {
+        println!("Stopped olsvr");
+    } else {
+        eprintln!("No running olsvr instance found");
+        std::process::exit(1);
     }
 }
 

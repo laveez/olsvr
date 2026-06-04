@@ -94,8 +94,19 @@ fn raise_to_screensaver_level(window: &Window) {
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 pub fn run(args: RunArgs) {
+    if args.activate {
+        eprintln!("--activate is not supported on macOS; the screensaver activates on idle.");
+        return;
+    }
+
     let mut config = Config::load();
     crate::merge_cli(&mut config, &args);
+
+    // Record our PID so `olsvr stop` and the setup wizard can find this instance.
+    let pid_file = crate::pid_path();
+    if let Err(e) = std::fs::write(&pid_file, std::process::id().to_string()) {
+        log::warn!("Failed to write PID file {}: {e}", pid_file.display());
+    }
 
     let timeout = Duration::from_secs(config.timeout as u64 * 60);
     let engine = Engine::new(config.activation, vec![0]);
@@ -260,6 +271,7 @@ impl Drop for MacApp {
         if self.cursor_hidden {
             unsafe { NSCursor::unhide() };
         }
+        let _ = std::fs::remove_file(crate::pid_path());
     }
 }
 

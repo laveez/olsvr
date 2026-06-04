@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 
 use core_foundation::base::TCFType;
 use core_foundation::string::{CFString, CFStringRef};
+use objc2_app_kit::{NSCursor, NSView, NSWindowCollectionBehavior};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
@@ -65,6 +67,29 @@ fn release_keep_awake(id: u32) {
     }
 }
 
+/// Raise a winit window to the macOS screen-saver level and make it span all
+/// Spaces / show over fullscreen apps, via the underlying NSWindow. Best-effort.
+fn raise_to_screensaver_level(window: &Window) {
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+    let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
+        return;
+    };
+    // SAFETY: winit hands us a live NSView pointer for this window.
+    unsafe {
+        let ns_view: &NSView = &*appkit.ns_view.as_ptr().cast::<NSView>();
+        if let Some(ns_window) = ns_view.window() {
+            ns_window.setLevel(1000); // NSScreenSaverWindowLevel
+            ns_window.setCollectionBehavior(
+                NSWindowCollectionBehavior::CanJoinAllSpaces
+                    | NSWindowCollectionBehavior::Stationary
+                    | NSWindowCollectionBehavior::FullScreenAuxiliary,
+            );
+        }
+    }
+}
+
 /// How often to poll the idle timer while waiting.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -90,6 +115,7 @@ pub fn run(args: RunArgs) {
         started: false,
         show_now: args.now,
         debug: args.debug,
+        cursor_hidden: false,
     };
     event_loop
         .run_app(&mut app)
@@ -114,6 +140,7 @@ struct MacApp {
     started: bool,
     show_now: bool,
     debug: bool,
+    cursor_hidden: bool,
 }
 
 impl MacApp {
@@ -122,7 +149,7 @@ impl MacApp {
         for cmd in cmds {
             match cmd {
                 EngineCommand::Show { .. } => self.show(event_loop),
-                EngineCommand::Hide => self.targets.clear(), // drops windows + renderers
+                EngineCommand::Hide => self.hide(),
                 EngineCommand::SetKeepAwake(true) => {
                     if self.keep_awake_id.is_none() {
                         self.keep_awake_id = acquire_keep_awake();
@@ -183,7 +210,7 @@ impl MacApp {
                     .expect("failed to create window"),
             );
             window.set_window_level(WindowLevel::AlwaysOnTop);
-            window.set_cursor_visible(false);
+            raise_to_screensaver_level(&window);
 
             let size = window.inner_size();
             let surface = instance
@@ -204,10 +231,24 @@ impl MacApp {
             window.request_redraw();
             self.targets.push(DisplayTarget { window, compositor });
         }
+
+        if !self.cursor_hidden {
+            unsafe { NSCursor::hide() };
+            self.cursor_hidden = true;
+        }
     }
 
     fn target_mut(&mut self, id: WindowId) -> Option<&mut DisplayTarget> {
         self.targets.iter_mut().find(|t| t.window.id() == id)
+    }
+
+    /// Hide the saver windows and restore the cursor.
+    fn hide(&mut self) {
+        self.targets.clear(); // drops windows + renderers
+        if self.cursor_hidden {
+            unsafe { NSCursor::unhide() };
+            self.cursor_hidden = false;
+        }
     }
 }
 
@@ -215,6 +256,9 @@ impl Drop for MacApp {
     fn drop(&mut self) {
         if let Some(id) = self.keep_awake_id.take() {
             release_keep_awake(id);
+        }
+        if self.cursor_hidden {
+            unsafe { NSCursor::unhide() };
         }
     }
 }

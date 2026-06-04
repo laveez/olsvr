@@ -39,3 +39,4 @@ dbus = "0.9"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 winit = "0.30"
+core-foundation = "0.10"

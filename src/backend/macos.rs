@@ -1,9 +1,10 @@
-//! macOS backend (skeleton stage): a winit fullscreen window rendered by the
+//! macOS backend: a winit fullscreen window per display, each rendered by the
 //! portable `Compositor`. Idle detection (CGEventSource), the display-sleep
-//! assertion (IOPMAssertion), and Engine wiring are layered on after this proves
-//! the renderer works on macOS.
+//! assertion (IOPMAssertion), and full Engine wiring are layered on next; this
+//! stage shows the saver on all displays with weather.
 
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -13,7 +14,7 @@ use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
 use crate::RunArgs;
 use crate::compositor::Compositor;
 use crate::config::Config;
-use crate::data::DataCache;
+use crate::data::{self, DataCache};
 
 pub fn run(args: RunArgs) {
     let mut config = Config::load();
@@ -25,8 +26,7 @@ pub fn run(args: RunArgs) {
     let mut app = MacApp {
         config,
         data_cache: Arc::new(RwLock::new(DataCache::default())),
-        window: None,
-        compositor: None,
+        targets: Vec::new(),
         debug: args.debug,
     };
     event_loop
@@ -34,76 +34,96 @@ pub fn run(args: RunArgs) {
         .expect("winit event loop error");
 }
 
+/// One fullscreen window + renderer per display.
+struct DisplayTarget {
+    window: Arc<Window>,
+    compositor: Compositor,
+}
+
 struct MacApp {
     config: Config,
     data_cache: Arc<RwLock<DataCache>>,
-    window: Option<Arc<Window>>,
-    compositor: Option<Compositor>,
+    targets: Vec<DisplayTarget>,
     debug: bool,
 }
 
 impl MacApp {
     fn show(&mut self, event_loop: &ActiveEventLoop) {
-        let attrs = Window::default_attributes()
-            .with_title("olsvr")
-            .with_fullscreen(Some(Fullscreen::Borderless(None)));
-        let window = Arc::new(
-            event_loop
-                .create_window(attrs)
-                .expect("failed to create window"),
-        );
-        // Raise above other windows so the saver is visible and the surface is
-        // not occluded (a proper NSScreenSaverWindowLevel via objc2 comes later).
-        window.set_window_level(WindowLevel::AlwaysOnTop);
-        let size = window.inner_size();
+        if !self.targets.is_empty() {
+            return;
+        }
+
+        // Start the weather fetch thread if a weather layer is configured.
+        if let Some((location, interval_secs)) = self.config.weather_config() {
+            data::start_fetch_thread(
+                self.data_cache.clone(),
+                location,
+                Duration::from_secs(interval_secs),
+            );
+        }
 
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
-        let surface = instance
-            .create_surface(window.clone())
-            .expect("failed to create surface");
 
-        let (layers, layer_configs) = self.config.build_layers(self.debug);
-        let comp = Compositor::new(
-            &instance,
-            surface,
-            size.width.max(1),
-            size.height.max(1),
-            layers,
-            &layer_configs,
-            self.data_cache.clone(),
-        );
+        let monitors: Vec<_> = event_loop.available_monitors().collect();
+        for monitor in monitors {
+            let attrs = Window::default_attributes()
+                .with_title("olsvr")
+                .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+            let window = Arc::new(
+                event_loop
+                    .create_window(attrs)
+                    .expect("failed to create window"),
+            );
+            window.set_window_level(WindowLevel::AlwaysOnTop);
+            window.set_cursor_visible(false);
 
-        self.compositor = Some(comp);
-        self.window = Some(window.clone());
-        window.request_redraw();
+            let size = window.inner_size();
+            let surface = instance
+                .create_surface(window.clone())
+                .expect("failed to create surface");
+
+            let (layers, layer_configs) = self.config.build_layers(self.debug);
+            let compositor = Compositor::new(
+                &instance,
+                surface,
+                size.width.max(1),
+                size.height.max(1),
+                layers,
+                &layer_configs,
+                self.data_cache.clone(),
+            );
+
+            window.request_redraw();
+            self.targets.push(DisplayTarget { window, compositor });
+        }
+    }
+
+    fn target_mut(&mut self, id: WindowId) -> Option<&mut DisplayTarget> {
+        self.targets.iter_mut().find(|t| t.window.id() == id)
     }
 }
 
 impl ApplicationHandler for MacApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        if self.window.is_none() {
-            self.show(event_loop);
-        }
+        self.show(event_loop);
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => {
-                if let Some(comp) = &mut self.compositor {
-                    comp.resize(size.width.max(1), size.height.max(1));
+                if let Some(t) = self.target_mut(id) {
+                    t.compositor.resize(size.width.max(1), size.height.max(1));
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(comp) = &mut self.compositor {
-                    comp.render_frame(None);
-                }
-                // Continuous animation: request the next frame.
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                if let Some(t) = self.target_mut(id) {
+                    t.compositor.render_frame(None);
+                    // Continuous animation: request the next frame for this window.
+                    t.window.request_redraw();
                 }
             }
             WindowEvent::KeyboardInput { .. }

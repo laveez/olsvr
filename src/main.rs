@@ -1,6 +1,7 @@
 mod animation;
 mod backend;
-#[cfg(target_os = "linux")]
+// Portable renderer; the macOS backend (next phase) uses it too.
+#[allow(dead_code)]
 mod compositor;
 mod config;
 mod data;

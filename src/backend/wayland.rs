@@ -476,7 +476,7 @@ impl WindowHandler for App {
             if ss.compositor.is_none() {
                 log::info!("Window configured: {w}x{h}, initializing compositor");
                 let (layer_list, layer_configs) = self.config.build_layers(self.debug);
-                let comp = Compositor::new(
+                let comp = Compositor::new_wayland(
                     &self.conn,
                     window.wl_surface(),
                     w,

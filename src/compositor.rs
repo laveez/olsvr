@@ -1,16 +1,20 @@
-use std::ptr::NonNull;
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use glyphon::{Cache, FontSystem, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport};
-use raw_window_handle::{
-    RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
-};
-use wayland_client::protocol::wl_surface::WlSurface;
-use wayland_client::{Connection, Proxy};
 
 use crate::data::DataCache;
 use crate::layer::{GpuContext, Layer};
+
+// Wayland surface creation lives in `new_wayland` and is Linux-only.
+#[cfg(target_os = "linux")]
+use raw_window_handle::{
+    RawDisplayHandle, RawWindowHandle, WaylandDisplayHandle, WaylandWindowHandle,
+};
+#[cfg(target_os = "linux")]
+use std::ptr::NonNull;
+#[cfg(target_os = "linux")]
+use wayland_client::{Connection, Proxy, protocol::wl_surface::WlSurface};
 
 pub struct DebugInfo {
     pub frame_count: u64,
@@ -37,35 +41,18 @@ pub struct Compositor {
 }
 
 impl Compositor {
+    /// Build the renderer from a platform-created surface and the `wgpu::Instance`
+    /// it was made from. The backend owns surface creation (Wayland raw handle on
+    /// Linux via `new_wayland`, winit window on macOS).
     pub fn new(
-        conn: &Connection,
-        wl_surface: &WlSurface,
+        instance: &wgpu::Instance,
+        surface: wgpu::Surface<'static>,
         width: u32,
         height: u32,
         mut layers: Vec<Box<dyn Layer>>,
         layer_configs: &[toml::value::Table],
         data_cache: Arc<RwLock<DataCache>>,
     ) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-
-        let display_ptr = conn.backend().display_ptr();
-        let surface_ptr = wl_surface.id().as_ptr();
-
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                raw_display_handle: Some(RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
-                    NonNull::new_unchecked(display_ptr as *mut _),
-                ))),
-                raw_window_handle: RawWindowHandle::Wayland(WaylandWindowHandle::new(
-                    NonNull::new_unchecked(surface_ptr as *mut _),
-                )),
-            })
-        }
-        .expect("Failed to create wgpu surface");
-
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: Some(&surface),
             ..Default::default()
@@ -140,6 +127,49 @@ impl Compositor {
             last_frame: Instant::now(),
             data_cache,
         }
+    }
+
+    /// Linux constructor: create the wgpu instance and a surface from the Wayland
+    /// display + surface, then build the portable renderer.
+    #[cfg(target_os = "linux")]
+    pub fn new_wayland(
+        conn: &Connection,
+        wl_surface: &WlSurface,
+        width: u32,
+        height: u32,
+        layers: Vec<Box<dyn Layer>>,
+        layer_configs: &[toml::value::Table],
+        data_cache: Arc<RwLock<DataCache>>,
+    ) -> Self {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::VULKAN,
+            ..wgpu::InstanceDescriptor::new_without_display_handle()
+        });
+
+        let display_ptr = conn.backend().display_ptr();
+        let surface_ptr = wl_surface.id().as_ptr();
+
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: Some(RawDisplayHandle::Wayland(WaylandDisplayHandle::new(
+                    NonNull::new_unchecked(display_ptr as *mut _),
+                ))),
+                raw_window_handle: RawWindowHandle::Wayland(WaylandWindowHandle::new(
+                    NonNull::new_unchecked(surface_ptr as *mut _),
+                )),
+            })
+        }
+        .expect("Failed to create wgpu surface");
+
+        Self::new(
+            &instance,
+            surface,
+            width,
+            height,
+            layers,
+            layer_configs,
+            data_cache,
+        )
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

@@ -151,7 +151,6 @@ fn run_screensaver(args: RunArgs) {
 }
 
 #[cfg(target_os = "macos")]
-fn run_screensaver(_args: RunArgs) {
-    eprintln!("olsvr: the macOS backend is not implemented yet (planned).");
-    std::process::exit(1);
+fn run_screensaver(args: RunArgs) {
+    backend::macos::run(args);
 }

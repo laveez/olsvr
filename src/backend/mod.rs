@@ -7,6 +7,9 @@ use crate::config::Config;
 #[cfg(target_os = "linux")]
 pub mod wayland;
 
+#[cfg(target_os = "macos")]
+pub mod macos;
+
 /// A platform backend owns the event loop: it builds an `Engine` from the config,
 /// translates platform events into engine events, and executes the engine's
 /// commands (show/hide surfaces, keep-awake, quit). Implemented per platform.

@@ -36,3 +36,6 @@ wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 calloop = { version = "0.14", features = ["signals"] }
 dbus = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"

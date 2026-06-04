@@ -5,6 +5,47 @@ use serde::{Deserialize, Serialize};
 use crate::layer::Layer;
 use crate::layers;
 
+/// Which displays the screensaver activates on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum DisplayScope {
+    /// Only the primary display (preserves the original single-window behavior).
+    #[default]
+    Primary,
+    /// Every connected display.
+    All,
+}
+
+/// When the backend holds a "keep the display awake" assertion/inhibitor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum KeepAwake {
+    /// Only while the screensaver is showing (mirrors the Wayland idle inhibitor).
+    #[default]
+    WhileActive,
+    /// For the whole time the daemon runs (the OLED never sleeps).
+    Always,
+    /// Never inhibit display sleep.
+    Off,
+}
+
+/// Activation + keep-awake policy, configured via the `[activation]` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Activation {
+    pub displays: DisplayScope,
+    pub keep_awake: KeepAwake,
+}
+
+impl Default for Activation {
+    fn default() -> Self {
+        Self {
+            displays: DisplayScope::Primary,
+            keep_awake: KeepAwake::WhileActive,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
@@ -19,6 +60,7 @@ pub struct Config {
     pub edge_padding: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub layers: Option<Vec<toml::value::Table>>,
+    pub activation: Activation,
 }
 
 impl Default for Config {
@@ -34,6 +76,7 @@ impl Default for Config {
             color: [255, 255, 255],
             edge_padding: 50,
             layers: None,
+            activation: Activation::default(),
         }
     }
 }
@@ -150,5 +193,31 @@ impl Config {
             }
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn activation_defaults_preserve_linux_behavior() {
+        let a = Activation::default();
+        assert_eq!(a.displays, DisplayScope::Primary);
+        assert_eq!(a.keep_awake, KeepAwake::WhileActive);
+    }
+
+    #[test]
+    fn config_without_activation_table_uses_defaults() {
+        let cfg: Config = toml::from_str("timeout = 5").unwrap();
+        assert_eq!(cfg.activation, Activation::default());
+    }
+
+    #[test]
+    fn activation_parses_all_and_always() {
+        let cfg: Config =
+            toml::from_str("[activation]\ndisplays = \"all\"\nkeep_awake = \"always\"").unwrap();
+        assert_eq!(cfg.activation.displays, DisplayScope::All);
+        assert_eq!(cfg.activation.keep_awake, KeepAwake::Always);
     }
 }

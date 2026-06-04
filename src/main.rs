@@ -4,6 +4,9 @@ mod backend;
 mod compositor;
 mod config;
 mod data;
+// Wired into the backends in a later phase; allow dead_code until then.
+#[allow(dead_code)]
+mod engine;
 mod layer;
 mod layers;
 mod setup;

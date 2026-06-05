@@ -19,7 +19,7 @@ use clap::{Parser, Subcommand};
 use crate::config::Config;
 
 #[derive(Parser)]
-#[command(name = "olsvr", about = "OLED screensaver for Wayland")]
+#[command(name = "olsvr", about = "OLED screensaver for Wayland and macOS")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,

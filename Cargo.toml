@@ -2,12 +2,12 @@
 name = "olsvr"
 version = "0.2.1"
 edition = "2024"
-description = "OLED screensaver for Wayland"
+description = "OLED screensaver for Wayland and macOS"
 license = "MIT"
 repository = "https://github.com/laveez/olsvr"
 homepage = "https://github.com/laveez/olsvr"
 readme = "README.md"
-keywords = ["wayland", "screensaver", "oled", "burn-in"]
+keywords = ["wayland", "macos", "screensaver", "oled", "burn-in"]
 categories = ["command-line-utilities"]
 
 [dependencies]

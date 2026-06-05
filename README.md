@@ -2,17 +2,18 @@
 
 # olsvr
 
-**OLED screensaver for Wayland — fade-animated clock on pure black**
+**OLED screensaver for Wayland and macOS — fade-animated clock on pure black**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-2024-orange?style=flat-square)](https://www.rust-lang.org)
 [![Wayland](https://img.shields.io/badge/Wayland-native-blueviolet?style=flat-square)](#)
+[![macOS](https://img.shields.io/badge/macOS-Metal-black?style=flat-square)](#)
 
 </div>
 
 ---
 
-olsvr prevents OLED burn-in by displaying a fading clock that periodically repositions itself on a pure black background. It activates after a configurable idle timeout, renders with GPU acceleration via wgpu, and dismisses on any keyboard or mouse input.
+olsvr prevents OLED burn-in by displaying a fading clock that periodically repositions itself on a pure black background. It activates after a configurable idle timeout, renders with GPU acceleration via wgpu, and dismisses on any keyboard or mouse input. It runs natively on Linux (Wayland, via Vulkan) and macOS (via Metal) behind a shared, platform-agnostic core.
 
 ![Demo](docs/demo.webp)
 
@@ -25,17 +26,19 @@ olsvr prevents OLED burn-in by displaying a fading clock that periodically repos
 
 ## Features
 
-- **Idle detection** — activates via `ext-idle-notify-v1` or D-Bus (GNOME) after configurable timeout
+- **Cross-platform** — native Linux (Wayland) and macOS backends behind a shared core
+- **Idle detection** — `ext-idle-notify-v1` or D-Bus (GNOME) on Wayland, CoreGraphics event idle on macOS, after a configurable timeout
 - **Fade animation** — clock fades in, holds, fades out, then teleports to a new position
 - **Quadrant-aware repositioning** — never lands in the same screen quadrant twice in a row
+- **Multi-display** — cover just the primary display or every connected display
 - **Weather overlay** — colored Nerd Font weather icons with temperature and wind speed via [FMI Open Data](https://en.ilmatieteenlaitos.fi/open-data)
-- **GPU-accelerated** — wgpu + glyphon text rendering on Vulkan
-- **Configurable** — font, size, color, timing, date/time format via `~/.olsvr.toml`
-- **Interactive setup wizard** — `olsvr setup` walks through configuration with live preview
-- **systemd integration** — setup wizard can install and enable a user service
-- **Manual trigger** — `olsvr run --activate` sends SIGUSR1 to a running instance
-- **Idle inhibitor** — prevents the system from sleeping while the screensaver is active
-- **Video-aware** — respects screensaver inhibitors (e.g. video playback) on both Wayland and D-Bus paths
+- **GPU-accelerated** — wgpu + glyphon text rendering (Vulkan on Wayland, Metal on macOS)
+- **Configurable** — font, size, color, timing, date/time format, activation policy via `~/.olsvr.toml`
+- **Interactive setup wizard** — `olsvr setup` walks through configuration with a live preview
+- **Autostart** — installs a systemd user service (Linux) or a launchd login agent with no Dock icon (macOS)
+- **Keep-awake** — holds a display-sleep inhibitor while active, or for the whole session (Wayland idle-inhibit / macOS `IOPMAssertion`)
+- **Manual trigger** — `olsvr run --activate` signals a running instance to show now (Wayland)
+- **Video-aware** — respects screensaver inhibitors such as video playback (Wayland)
 - **Input dismissal** — any key press or mouse movement deactivates immediately
 
 ---
@@ -62,6 +65,8 @@ olsvr run --now
 olsvr stop
 ```
 
+> **macOS:** if `olsvr` isn't found after `cargo install`, add `~/.cargo/bin` to your `PATH` — rustup does this automatically, but Homebrew's cargo does not.
+
 ---
 
 ## Setup Wizard
@@ -72,7 +77,7 @@ Running `olsvr setup` (or just `olsvr` on first run) starts an interactive wizar
 2. **Display** — font size, family, time/date format, brightness, padding
 3. **Weather** — enable/disable weather overlay, location, icon font
 4. **Preview** — launch a live preview to see your settings
-5. **systemd** — optionally install as a user service that starts on login
+5. **Autostart** — optionally install a systemd user service (Linux) or a launchd login agent (macOS) that starts on login
 
 The wizard writes `~/.olsvr.toml` and can be re-run at any time to adjust settings.
 
@@ -107,6 +112,15 @@ The weather overlay shows a colored icon, temperature, and wind speed below the 
 | `font_size` | Weather text size (pixels) | `28` |
 | `icon_font` | Nerd Font family for weather icons | `MesloLGS NF` |
 
+### Activation
+
+The `[activation]` table controls which displays the screensaver covers and how it keeps the panel awake. The defaults preserve the original single-display, inhibit-while-active behavior.
+
+| Field | Description | Default |
+|---|---|---|
+| `displays` | `primary` (primary display only) or `all` (every connected display). Multi-display is currently macOS; the Wayland backend renders a single fullscreen surface. | `primary` |
+| `keep_awake` | `while-active` (inhibit display sleep only while showing), `always` (keep the panel awake for the whole session), or `off` | `while-active` |
+
 ### Example
 
 ```toml
@@ -129,6 +143,10 @@ location = "helsinki"
 update_interval = 600
 font_size = 28
 icon_font = "MesloLGS NF"
+
+[activation]
+displays = "all"
+keep_awake = "always"
 ```
 
 ### CLI flags
@@ -169,19 +187,27 @@ The animation cycle runs continuously while the screensaver is active:
 3. **Fade out** — opacity drops back to 0
 4. **Reposition** — clock teleports to a new quadrant (never the same one twice in a row)
 
-The screensaver creates a fullscreen Wayland window with a pure black background. An idle inhibitor prevents the system from sleeping while active. Any keyboard or mouse input dismisses it immediately.
+The screensaver creates a fullscreen black surface on each target display — a Wayland window on Linux, or a borderless `NSWindow` at screen-saver level on macOS. A display-sleep inhibitor keeps the panel awake while active. Any keyboard or mouse input dismisses it immediately.
 
 ---
 
 ## Requirements
 
-- **Wayland compositor** — GNOME, Sway, Hyprland, etc.
 - **Rust toolchain** for building from source
-- **GPU** with Vulkan support (wgpu backend)
-- **libdbus** (for GNOME D-Bus fallback) — `libdbus-1-dev` on Debian/Ubuntu, `dbus-devel` on Fedora
 - **Nerd Font** (optional, for weather icons) — install from [nerdfonts.com](https://www.nerdfonts.com/)
 
-> Idle detection uses `ext-idle-notify-v1` (Sway, Hyprland) with automatic D-Bus fallback for GNOME/Mutter. Manual trigger is also available: `olsvr run --activate`
+**Linux (Wayland):**
+
+- A Wayland compositor — GNOME, Sway, Hyprland, etc.
+- A GPU with Vulkan support (wgpu backend)
+- **libdbus** (for the GNOME D-Bus idle fallback) — `libdbus-1-dev` on Debian/Ubuntu, `dbus-devel` on Fedora
+
+**macOS:**
+
+- macOS 11 (Big Sur) or newer — renders with Metal via wgpu
+- No extra dependencies
+
+> On Wayland, idle detection uses `ext-idle-notify-v1` (Sway, Hyprland) with an automatic D-Bus fallback for GNOME/Mutter, plus a manual `olsvr run --activate` trigger. On macOS, idle is polled from CoreGraphics and the login agent runs without a Dock icon.
 
 ---
 

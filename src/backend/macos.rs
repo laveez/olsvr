@@ -3,6 +3,7 @@
 //! `CGEventSourceSecondsSinceLastEventType`; the display is kept awake with an
 //! `IOPMAssertion` (the OLED-stays-awake / HDMI-redetect fix).
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -117,6 +118,70 @@ fn configure_saver_window(window: &Window) {
 /// How often to poll the idle timer while waiting.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// If the render loop goes this long without drawing a frame while the saver is
+/// active, the watchdog force-exits to release the screen.
+const WATCHDOG_STALL: Duration = Duration::from_secs(5);
+
+/// Safety net against a trapped screen. The saver window sits at screen-saver
+/// level above everything, so if the render/event loop ever stalls (e.g. a GPU
+/// surface call blocking on a display glitch) the black window would be left with
+/// no way to dismiss it. This separate thread force-exits if no frame is drawn
+/// for `WATCHDOG_STALL` while active. A clean `exit(0)` lets the display recover
+/// and, because the launchd agent's KeepAlive only restarts on failure, does not
+/// relaunch into another black-out.
+struct Watchdog {
+    start: Instant,
+    last_beat_ms: AtomicU64,
+    active: AtomicBool,
+}
+
+impl Watchdog {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            start: Instant::now(),
+            last_beat_ms: AtomicU64::new(0),
+            active: AtomicBool::new(false),
+        })
+    }
+
+    /// Record that a frame was just drawn.
+    fn beat(&self) {
+        self.last_beat_ms
+            .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    }
+
+    /// Arm (true) or disarm (false) staleness checking. Arming also beats, so the
+    /// stall window starts fresh from `show()` (covers a hang during GPU init).
+    fn set_active(&self, active: bool) {
+        if active {
+            self.beat();
+        }
+        self.active.store(active, Ordering::Relaxed);
+    }
+
+    fn spawn(self: &Arc<Self>) {
+        let wd = Arc::clone(self);
+        let stall_ms = WATCHDOG_STALL.as_millis() as u64;
+        std::thread::spawn(move || {
+            loop {
+                std::thread::sleep(Duration::from_secs(1));
+                if !wd.active.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let elapsed = wd.start.elapsed().as_millis() as u64;
+                let since_beat = elapsed.saturating_sub(wd.last_beat_ms.load(Ordering::Relaxed));
+                if since_beat > stall_ms {
+                    log::error!(
+                        "watchdog: render stalled {since_beat}ms while active — exiting to release the display"
+                    );
+                    let _ = std::fs::remove_file(crate::pid_path());
+                    std::process::exit(0);
+                }
+            }
+        });
+    }
+}
+
 pub fn run(args: RunArgs) {
     if args.activate {
         eprintln!("--activate is not supported on macOS; the screensaver activates on idle.");
@@ -135,6 +200,10 @@ pub fn run(args: RunArgs) {
     let timeout = Duration::from_secs(config.timeout as u64 * 60);
     let engine = Engine::new(config.activation, vec![0]);
 
+    // Watchdog guards against a trapped screen if the render loop ever stalls.
+    let watchdog = Watchdog::new();
+    watchdog.spawn();
+
     let event_loop = EventLoop::new().expect("failed to create winit event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
 
@@ -151,6 +220,7 @@ pub fn run(args: RunArgs) {
         show_now: args.now,
         debug: args.debug,
         cursor_hidden: false,
+        watchdog,
     };
     event_loop
         .run_app(&mut app)
@@ -176,6 +246,7 @@ struct MacApp {
     show_now: bool,
     debug: bool,
     cursor_hidden: bool,
+    watchdog: Arc<Watchdog>,
 }
 
 impl MacApp {
@@ -230,6 +301,10 @@ impl MacApp {
             ..wgpu::InstanceDescriptor::new_without_display_handle()
         });
 
+        // Arm the watchdog for the whole show + render path (covers a hang during
+        // GPU init too); disarmed again below if no window could be created.
+        self.watchdog.set_active(true);
+
         let mut monitors: Vec<_> = event_loop.available_monitors().collect();
         if self.config.activation.displays == DisplayScope::Primary {
             monitors.truncate(1);
@@ -239,27 +314,34 @@ impl MacApp {
             // Borderless window placed on this monitor; configure_saver_window
             // then snaps it to the exact screen frame at screen-saver level.
             // (Not winit's Fullscreen::Borderless — an LSUIElement accessory app
-            // can't drive that correctly.)
+            // can't drive that correctly.) Failures skip the display instead of
+            // aborting the process.
             let attrs = Window::default_attributes()
                 .with_title("olsvr")
                 .with_decorations(false)
                 .with_position(monitor.position())
                 .with_inner_size(monitor.size());
-            let window = Arc::new(
-                event_loop
-                    .create_window(attrs)
-                    .expect("failed to create window"),
-            );
+            let window = match event_loop.create_window(attrs) {
+                Ok(w) => Arc::new(w),
+                Err(e) => {
+                    log::error!("Failed to create saver window, skipping display: {e}");
+                    continue;
+                }
+            };
             window.set_window_level(WindowLevel::AlwaysOnTop);
             configure_saver_window(&window);
 
             let size = window.inner_size();
-            let surface = instance
-                .create_surface(window.clone())
-                .expect("failed to create surface");
+            let surface = match instance.create_surface(window.clone()) {
+                Ok(s) => s,
+                Err(e) => {
+                    log::error!("Failed to create surface, skipping display: {e}");
+                    continue;
+                }
+            };
 
             let (layers, layer_configs) = self.config.build_layers(self.debug);
-            let compositor = Compositor::new(
+            let Some(compositor) = Compositor::new(
                 &instance,
                 surface,
                 size.width.max(1),
@@ -267,10 +349,20 @@ impl MacApp {
                 layers,
                 &layer_configs,
                 self.data_cache.clone(),
-            );
+            ) else {
+                log::error!("Failed to init renderer, skipping display");
+                continue;
+            };
 
             window.request_redraw();
             self.targets.push(DisplayTarget { window, compositor });
+        }
+
+        if self.targets.is_empty() {
+            // Nothing came up — disarm so the watchdog doesn't fire while dormant.
+            log::error!("No saver windows could be created; staying dormant");
+            self.watchdog.set_active(false);
+            return;
         }
 
         if !self.cursor_hidden {
@@ -286,6 +378,7 @@ impl MacApp {
     /// Hide the saver windows and restore the cursor.
     fn hide(&mut self) {
         self.targets.clear(); // drops windows + renderers
+        self.watchdog.set_active(false);
         if self.cursor_hidden {
             unsafe { NSCursor::unhide() };
             self.cursor_hidden = false;
@@ -341,10 +434,14 @@ impl ApplicationHandler for MacApp {
                 }
             }
             WindowEvent::RedrawRequested => {
+                let mut drew = false;
                 if let Some(t) = self.target_mut(id) {
-                    t.compositor.render_frame(None);
+                    drew = t.compositor.render_frame(None);
                     // Continuous animation: request the next frame for this window.
                     t.window.request_redraw();
+                }
+                if drew {
+                    self.watchdog.beat();
                 }
             }
             WindowEvent::KeyboardInput { .. }

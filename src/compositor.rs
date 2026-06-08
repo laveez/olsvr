@@ -67,21 +67,35 @@ impl Compositor {
         mut layers: Vec<Box<dyn Layer>>,
         layer_configs: &[toml::value::Table],
         data_cache: Arc<RwLock<DataCache>>,
-    ) -> Self {
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .expect("No suitable GPU adapter found");
+    ) -> Option<Self> {
+        // Fallible so a backend can recover (the macOS saver skips the display)
+        // instead of aborting the whole process on a GPU init failure.
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                compatible_surface: Some(&surface),
+                ..Default::default()
+            })) {
+                Ok(a) => a,
+                Err(e) => {
+                    log::error!("No suitable GPU adapter found: {e}");
+                    return None;
+                }
+            };
 
-        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+        let device_queue = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("olsvr"),
             // Use the adapter's real limits so large HiDPI surfaces (e.g. a 2x
             // 5120x1440 panel = 10240x2880) fit; the default caps texture size at 8192.
             required_limits: adapter.limits(),
             ..Default::default()
-        }))
-        .expect("Failed to create device");
+        }));
+        let (device, queue) = match device_queue {
+            Ok(dq) => dq,
+            Err(e) => {
+                log::error!("Failed to create GPU device: {e}");
+                return None;
+            }
+        };
 
         // Some displays report a physical (HiDPI) size larger than the GPU's max
         // texture dimension; clamp the surface so configure() can't fail. The
@@ -136,7 +150,7 @@ impl Compositor {
             layer.init(&ctx, &mut font_system, &cfg, data_cache.clone());
         }
 
-        Self {
+        Some(Self {
             surface,
             device,
             queue,
@@ -151,7 +165,7 @@ impl Compositor {
             last_frame: Instant::now(),
             data_cache,
             max_texture_dim,
-        }
+        })
     }
 
     /// Linux constructor: create the wgpu instance and a surface from the Wayland
@@ -195,6 +209,7 @@ impl Compositor {
             layer_configs,
             data_cache,
         )
+        .expect("Failed to create compositor")
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {
@@ -207,7 +222,9 @@ impl Compositor {
         }
     }
 
-    pub fn render_frame(&mut self, debug_info: Option<&DebugInfo>) {
+    /// Render one frame. Returns `true` if a frame was presented; `false` if it
+    /// was skipped (the macOS watchdog treats a run of `false` as a stall).
+    pub fn render_frame(&mut self, debug_info: Option<&DebugInfo>) -> bool {
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -249,17 +266,18 @@ impl Compositor {
             },
         );
 
-        self.text_renderer
-            .prepare(
-                &self.device,
-                &self.queue,
-                &mut self.font_system,
-                &mut self.text_atlas,
-                &self.viewport,
-                text_areas,
-                &mut self.swash_cache,
-            )
-            .expect("Failed to prepare text");
+        if let Err(e) = self.text_renderer.prepare(
+            &self.device,
+            &self.queue,
+            &mut self.font_system,
+            &mut self.text_atlas,
+            &self.viewport,
+            text_areas,
+            &mut self.swash_cache,
+        ) {
+            log::warn!("Text prepare failed, skipping frame: {e}");
+            return false;
+        }
 
         // 5. Get surface texture
         let t0 = Instant::now();
@@ -273,17 +291,17 @@ impl Compositor {
                     wgpu::CurrentSurfaceTexture::Success(t) => t,
                     other => {
                         log::warn!("Failed to get surface texture after reconfigure: {other:?}");
-                        return;
+                        return false;
                     }
                 }
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 log::warn!("Surface texture timeout or occluded, skipping frame");
-                return;
+                return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 log::warn!("Surface texture validation error, skipping frame");
-                return;
+                return false;
             }
         };
         let texture_ms = t0.elapsed().as_millis();
@@ -311,10 +329,13 @@ impl Compositor {
                 layer.render_custom(&mut pass);
             }
 
-            // 8. Text on top
-            self.text_renderer
+            // 8. Text on top (degrade to a black frame rather than abort on error)
+            if let Err(e) = self
+                .text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)
-                .expect("Failed to render text");
+            {
+                log::warn!("Text render failed, presenting without it: {e}");
+            }
         }
 
         let t1 = Instant::now();
@@ -332,5 +353,6 @@ impl Compositor {
         }
 
         self.text_atlas.trim();
+        true
     }
 }

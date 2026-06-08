@@ -624,6 +624,12 @@ fn install_launchd_agent() {
     <key>RUST_LOG</key>
     <string>info</string>
   </dict>
+  <key>StandardOutPath</key>
+  <string>{home}/Library/Logs/olsvr.log</string>
+  <key>StandardErrorPath</key>
+  <string>{home}/Library/Logs/olsvr.log</string>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
 </dict>
 </plist>
 "#

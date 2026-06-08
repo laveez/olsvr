@@ -571,6 +571,21 @@ fn create_app_bundle() -> Option<String> {
         return None;
     }
 
+    // Ad-hoc codesign the bundle. The linker's signature on the bare binary fails
+    // validation once it is a bundle's main executable, so the agent gets
+    // AMFI-killed at launch (SIGKILL, OS_REASON_CODESIGNING) unless re-signed in
+    // the bundle context.
+    let signed = Command::new("codesign")
+        .args(["--force", "--sign", "-", &app_dir])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !signed {
+        eprintln!(
+            "Warning: codesign failed for {app_dir}; the login agent may be killed at launch"
+        );
+    }
+
     println!("  Created app bundle at {app_dir}");
     Some(exe_dst)
 }

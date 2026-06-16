@@ -39,6 +39,8 @@ pub struct Compositor {
     last_frame: Instant,
     data_cache: Arc<RwLock<DataCache>>,
     max_texture_dim: u32,
+    skips: u32,
+    last_skip_log: Instant,
 }
 
 /// Scale `(w, h)` down proportionally so neither exceeds `max` (the GPU's max
@@ -165,6 +167,8 @@ impl Compositor {
             last_frame: Instant::now(),
             data_cache,
             max_texture_dim,
+            skips: 0,
+            last_skip_log: Instant::now(),
         })
     }
 
@@ -225,6 +229,16 @@ impl Compositor {
     /// Render one frame. Returns `true` if a frame was presented; `false` if it
     /// was skipped (the macOS watchdog treats a run of `false` as a stall).
     pub fn render_frame(&mut self, debug_info: Option<&DebugInfo>) -> bool {
+        // Summarize skipped frames at most once per second (a brief burst at show time is normal).
+        if self.skips > 0 && self.last_skip_log.elapsed().as_secs() >= 1 {
+            log::debug!(
+                "surface {}x{}: {} frame(s) skipped (timeout/occluded) in the last ~1s",
+                self.config.width,
+                self.config.height,
+                self.skips
+            );
+            self.skips = 0;
+        }
         let now = Instant::now();
         let dt = now.duration_since(self.last_frame).as_secs_f32();
         self.last_frame = now;
@@ -296,7 +310,10 @@ impl Compositor {
                 }
             }
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                log::warn!("Surface texture timeout or occluded, skipping frame");
+                if self.skips == 0 {
+                    self.last_skip_log = Instant::now();
+                }
+                self.skips += 1;
                 return false;
             }
             wgpu::CurrentSurfaceTexture::Validation => {

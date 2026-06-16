@@ -9,12 +9,12 @@ use std::time::{Duration, Instant};
 
 use core_foundation::base::TCFType;
 use core_foundation::string::{CFString, CFStringRef};
-use objc2_app_kit::{NSColor, NSCursor, NSView, NSWindowCollectionBehavior};
+use objc2_app_kit::{NSColor, NSCursor, NSView, NSWindowCollectionBehavior, NSWindowStyleMask};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Window, WindowId, WindowLevel};
+use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
 
 use crate::RunArgs;
 use crate::compositor::Compositor;
@@ -27,6 +27,9 @@ use crate::engine::{BackendEvent, Engine, EngineCommand};
 #[link(name = "CoreGraphics", kind = "framework")]
 unsafe extern "C" {
     fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
+    fn CGDisplayHideCursor(display: u32) -> i32;
+    fn CGDisplayShowCursor(display: u32) -> i32;
+    fn CGMainDisplayID() -> u32;
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -44,6 +47,22 @@ unsafe extern "C" {
 fn idle_seconds() -> f64 {
     // kCGEventSourceStateCombinedSessionState = 0, kCGAnyInputEventType = !0
     unsafe { CGEventSourceSecondsSinceLastEventType(0, u32::MAX) }
+}
+
+/// Hide the cursor everywhere. `NSCursor::hide()` only takes effect where the
+/// (accessory) app holds focus, so pair it with CoreGraphics' system-wide hide.
+fn hide_cursor() {
+    unsafe {
+        NSCursor::hide();
+        CGDisplayHideCursor(CGMainDisplayID());
+    }
+}
+
+fn show_cursor() {
+    unsafe {
+        NSCursor::unhide();
+        CGDisplayShowCursor(CGMainDisplayID());
+    }
 }
 
 /// Acquire a "prevent the display from idle-sleeping" assertion.
@@ -68,15 +87,10 @@ fn release_keep_awake(id: u32) {
     }
 }
 
-/// Make a winit window a full-display screen-saver overlay via the underlying
-/// NSWindow: screen-saver level (draws over the menu bar and Dock), visible on
-/// all Spaces, and sized to the exact screen frame.
-///
-/// We size the window ourselves instead of using winit's `Fullscreen::Borderless`
-/// because that relies on hiding the menu bar through presentation options, which
-/// an `LSUIElement` accessory app can't do — so its fullscreen silently downgrades
-/// to a partial window. At screen-saver level the overlay simply draws over the
-/// menu bar and Dock, so the app's activation policy no longer matters.
+/// Turn the winit window (already placed on its monitor by `Fullscreen::Borderless`)
+/// into a full-display screen-saver overlay via the underlying NSWindow: borderless
+/// and sized to the whole screen frame at screen-saver level (drawing over the menu
+/// bar and Dock), visible on all Spaces, opaque black.
 fn configure_saver_window(window: &Window) {
     let Ok(handle) = window.window_handle() else {
         return;
@@ -94,19 +108,24 @@ fn configure_saver_window(window: &Window) {
                     | NSWindowCollectionBehavior::Stationary
                     | NSWindowCollectionBehavior::FullScreenAuxiliary,
             );
-            // Cover the whole display, menu-bar region included. Overscan a
-            // couple points beyond the screen frame so HiDPI rounding can't leave
-            // a 1px seam at the edges; the excess is clipped off-screen.
+            // Fullscreen::Borderless placed the window on the right monitor (so
+            // screen() is correct here) but left it a *titled* window, which macOS
+            // clamps to the visibleFrame — a titled window can't cover the menu
+            // bar, so setFrame to the full frame was silently shrunk. Make it
+            // borderless first (lifts the clamp and removes the title bar), then
+            // size it to the full screen frame. Overscan a couple points so HiDPI
+            // rounding can't leave a seam; the excess is clipped off-screen.
             if let Some(screen) = ns_window.screen() {
                 let mut frame = screen.frame();
                 frame.origin.x -= 2.0;
                 frame.origin.y -= 2.0;
                 frame.size.width += 4.0;
                 frame.size.height += 4.0;
+                ns_window.setStyleMask(NSWindowStyleMask::Borderless);
                 ns_window.setFrame_display(frame, true);
             }
-            // Paint the window itself black (and drop the shadow) so nothing grey
-            // can show at the edges even if the GPU surface doesn't perfectly cover.
+            // Paint the window black (drop the shadow) so any margin the GPU
+            // surface doesn't cover reads black, not grey.
             ns_window.setOpaque(true);
             ns_window.setHasShadow(false);
             ns_window.setBackgroundColor(Some(&*NSColor::blackColor()));
@@ -117,6 +136,13 @@ fn configure_saver_window(window: &Window) {
 
 /// How often to poll the idle timer while waiting.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+/// While the saver is showing, a system idle time below this means fresh user
+/// input, so dismiss. The borderless accessory windows don't reliably receive
+/// key/mouse events themselves, so the system-wide idle timer is the reliable
+/// dismiss signal. Kept below the Engine's 1s dismiss-grace so a `--now` preview
+/// isn't dismissed by the keystroke that launched it.
+const DISMISS_IDLE_SECS: f64 = 0.5;
 
 /// If the render loop goes this long without drawing a frame while the saver is
 /// active, the watchdog force-exits to release the screen.
@@ -214,7 +240,6 @@ pub fn run(args: RunArgs) {
         targets: Vec::new(),
         keep_awake_id: None,
         timeout,
-        was_idle: false,
         weather_started: false,
         started: false,
         show_now: args.now,
@@ -240,7 +265,6 @@ struct MacApp {
     targets: Vec<DisplayTarget>,
     keep_awake_id: Option<u32>,
     timeout: Duration,
-    was_idle: bool,
     weather_started: bool,
     started: bool,
     show_now: bool,
@@ -311,16 +335,16 @@ impl MacApp {
         }
 
         for monitor in monitors {
-            // Borderless window placed on this monitor; configure_saver_window
-            // then snaps it to the exact screen frame at screen-saver level.
-            // (Not winit's Fullscreen::Borderless — an LSUIElement accessory app
-            // can't drive that correctly.) Failures skip the display instead of
-            // aborting the process.
+            // Fullscreen-borderless on this specific monitor. winit's
+            // `with_position` is unreliable across mixed-DPI displays — the
+            // external monitor's coordinates fall inside the primary's physical
+            // bounds, so the window never leaves the primary — whereas the monitor
+            // handle targets the right display directly. configure_saver_window
+            // then snaps it to the (now correct) screen frame at screen-saver
+            // level. Failures skip the display instead of aborting the process.
             let attrs = Window::default_attributes()
                 .with_title("olsvr")
-                .with_decorations(false)
-                .with_position(monitor.position())
-                .with_inner_size(monitor.size());
+                .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
             let window = match event_loop.create_window(attrs) {
                 Ok(w) => Arc::new(w),
                 Err(e) => {
@@ -365,8 +389,22 @@ impl MacApp {
             return;
         }
 
+        // Activate the app so the cursor hide reaches every display — cursor
+        // hiding only takes effect while the app holds focus. An LSUIElement app
+        // has no Dock icon, so activating costs nothing visible. (The earlier
+        // "activation breaks multi-display" was really the with_position bug,
+        // since fixed by Fullscreen::Borderless.)
+        // SAFETY: main thread; NSApplication is the live singleton.
+        unsafe {
+            let app: *mut objc2::runtime::AnyObject =
+                objc2::msg_send![objc2::class!(NSApplication), sharedApplication];
+            if !app.is_null() {
+                let _: () = objc2::msg_send![app, activateIgnoringOtherApps: true];
+            }
+        }
+
         if !self.cursor_hidden {
-            unsafe { NSCursor::hide() };
+            hide_cursor();
             self.cursor_hidden = true;
         }
     }
@@ -380,7 +418,7 @@ impl MacApp {
         self.targets.clear(); // drops windows + renderers
         self.watchdog.set_active(false);
         if self.cursor_hidden {
-            unsafe { NSCursor::unhide() };
+            show_cursor();
             self.cursor_hidden = false;
         }
     }
@@ -392,7 +430,7 @@ impl Drop for MacApp {
             release_keep_awake(id);
         }
         if self.cursor_hidden {
-            unsafe { NSCursor::unhide() };
+            show_cursor();
         }
         let _ = std::fs::remove_file(crate::pid_path());
     }
@@ -413,14 +451,17 @@ impl ApplicationHandler for MacApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        // Drive the Engine from the idle timer on idle/active transitions.
-        let is_idle = idle_seconds() >= self.timeout.as_secs_f64();
-        if is_idle && !self.was_idle {
-            self.was_idle = true;
+        // Drive the Engine from the system-wide idle timer. This is the reliable
+        // dismiss path: the saver windows are borderless and the app is an
+        // accessory, so they don't always get key/mouse events themselves.
+        let idle = idle_seconds();
+        let showing = !self.targets.is_empty();
+        if !showing && idle >= self.timeout.as_secs_f64() {
             self.on_event(BackendEvent::Idle, event_loop);
-        } else if !is_idle && self.was_idle {
-            self.was_idle = false;
-            self.on_event(BackendEvent::Resume, event_loop);
+        } else if showing && idle < DISMISS_IDLE_SECS {
+            // Fresh input while showing — dismiss. DismissInput (1s grace), not
+            // Resume (5s), so it's responsive even if you return right away.
+            self.on_event(BackendEvent::DismissInput, event_loop);
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL_INTERVAL));
     }
@@ -447,8 +488,8 @@ impl ApplicationHandler for MacApp {
             WindowEvent::KeyboardInput { .. }
             | WindowEvent::MouseInput { .. }
             | WindowEvent::CursorMoved { .. } => {
-                // Input dismisses the saver but keeps the process running.
-                self.was_idle = false;
+                // Fast path when the window does receive input; the idle poll in
+                // about_to_wait is the reliable fallback. Keeps the process running.
                 self.on_event(BackendEvent::DismissInput, event_loop);
             }
             _ => {}

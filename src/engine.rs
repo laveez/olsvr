@@ -15,11 +15,14 @@ pub type DisplayId = u32;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendEvent {
     Idle,
+    /// Emitted only by the Wayland backend (macOS dismisses via `DismissInput`).
+    #[allow(dead_code)]
     Resume,
     DismissInput,
     ActivateSignal,
+    /// Reserved graceful-shutdown event; no backend emits it yet.
+    #[allow(dead_code)]
     Quit,
-    DisplaysChanged(Vec<DisplayId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,16 +126,6 @@ impl Engine {
                     return vec![];
                 }
                 self.deactivate()
-            }
-            BackendEvent::DisplaysChanged(ids) => {
-                self.displays = ids;
-                if matches!(self.state, State::Active { .. }) {
-                    vec![EngineCommand::Show {
-                        displays: self.target_displays(),
-                    }]
-                } else {
-                    vec![]
-                }
             }
             BackendEvent::Quit => {
                 let mut cmds = self.deactivate();

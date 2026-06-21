@@ -3,6 +3,7 @@
 //! `CGEventSourceSecondsSinceLastEventType`; the display is kept awake with an
 //! `IOPMAssertion` (the OLED-stays-awake / HDMI-redetect fix).
 
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -41,6 +42,25 @@ unsafe extern "C" {
         assertion_id: *mut u32,
     ) -> i32;
     fn IOPMAssertionRelease(assertion_id: u32) -> i32;
+    /// Fills `*out` with a CFDictionary `{pid: [assertion dicts]}`; caller releases it.
+    fn IOPMCopyAssertionsByProcess(out: *mut *const c_void) -> i32;
+}
+
+// CoreFoundation accessors for walking the IOPMCopyAssertionsByProcess result.
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRelease(cf: *const c_void);
+    fn CFEqual(a: *const c_void, b: *const c_void) -> u8;
+    fn CFDictionaryGetCount(dict: *const c_void) -> isize;
+    fn CFDictionaryGetKeysAndValues(
+        dict: *const c_void,
+        keys: *mut *const c_void,
+        values: *mut *const c_void,
+    );
+    fn CFDictionaryGetValue(dict: *const c_void, key: *const c_void) -> *const c_void;
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    fn CFNumberGetValue(number: *const c_void, number_type: isize, value: *mut c_void) -> u8;
 }
 
 /// Seconds since the last HID input, system-wide.
@@ -85,6 +105,63 @@ fn release_keep_awake(id: u32) {
     unsafe {
         IOPMAssertionRelease(id);
     }
+}
+
+/// True if a process *other than us* currently holds a `PreventUserIdleDisplaySleep`
+/// assertion — e.g. a video player or presentation keeping the screen on. The macOS
+/// analog of the Wayland `IsInhibited` check, so the saver doesn't cover playing
+/// video. Our own keep-awake assertion (held under some `keep_awake` policies) is
+/// ignored by comparing the owning PID against ours.
+fn display_sleep_inhibited() -> bool {
+    const KCF_NUMBER_SINT32_TYPE: isize = 3;
+    let own_pid = std::process::id() as i32;
+
+    let mut by_pid: *const c_void = std::ptr::null();
+    // SAFETY: IOKit fills in a CFDictionary we own (create rule); freed below.
+    if unsafe { IOPMCopyAssertionsByProcess(&mut by_pid) } != 0 || by_pid.is_null() {
+        return false; // can't determine — don't suppress activation
+    }
+
+    let display_type = CFString::new("PreventUserIdleDisplaySleep");
+    let type_key = CFString::new("AssertType");
+    let mut inhibited = false;
+
+    // SAFETY: walk the documented `{pid: [{AssertType: ...}, ...]}` structure, then
+    // release the dictionary. Inner keys/values are borrowed (get rule).
+    unsafe {
+        let count = CFDictionaryGetCount(by_pid).max(0) as usize;
+        let mut pids = vec![std::ptr::null::<c_void>(); count];
+        let mut lists = vec![std::ptr::null::<c_void>(); count];
+        CFDictionaryGetKeysAndValues(by_pid, pids.as_mut_ptr(), lists.as_mut_ptr());
+
+        'scan: for i in 0..count {
+            let mut pid: i32 = 0;
+            let read = CFNumberGetValue(
+                pids[i],
+                KCF_NUMBER_SINT32_TYPE,
+                &mut pid as *mut i32 as *mut c_void,
+            );
+            if read == 0 || pid == own_pid {
+                continue;
+            }
+            let list = lists[i];
+            for j in 0..CFArrayGetCount(list) {
+                let assertion = CFArrayGetValueAtIndex(list, j);
+                let ty = CFDictionaryGetValue(
+                    assertion,
+                    type_key.as_concrete_TypeRef() as *const c_void,
+                );
+                if !ty.is_null()
+                    && CFEqual(ty, display_type.as_concrete_TypeRef() as *const c_void) != 0
+                {
+                    inhibited = true;
+                    break 'scan;
+                }
+            }
+        }
+        CFRelease(by_pid);
+    }
+    inhibited
 }
 
 /// Turn the winit window (already placed on its monitor by `Fullscreen::Borderless`)
@@ -456,7 +533,9 @@ impl ApplicationHandler for MacApp {
         // accessory, so they don't always get key/mouse events themselves.
         let idle = idle_seconds();
         let showing = !self.targets.is_empty();
-        if !showing && idle >= self.timeout.as_secs_f64() {
+        if !showing && idle >= self.timeout.as_secs_f64() && !display_sleep_inhibited() {
+            // Skip activation while another app holds a display-sleep assertion
+            // (video playback, presentations) so the saver doesn't cover it.
             self.on_event(BackendEvent::Idle, event_loop);
         } else if showing && idle < DISMISS_IDLE_SECS {
             // Fresh input while showing — dismiss. DismissInput (1s grace), not

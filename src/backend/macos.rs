@@ -1,5 +1,5 @@
-//! macOS backend: a winit fullscreen window per display rendered by the portable
-//! `Compositor`, driven by the shared `Engine`. Idle is detected by polling
+//! macOS backend: a borderless screen-saver-level window per display rendered by the
+//! portable `Compositor`, driven by the shared `Engine`. Idle is detected by polling
 //! `CGEventSourceSecondsSinceLastEventType`; the display is kept awake with an
 //! `IOPMAssertion` (the OLED-stays-awake / HDMI-redetect fix).
 
@@ -10,12 +10,17 @@ use std::time::{Duration, Instant};
 
 use core_foundation::base::TCFType;
 use core_foundation::string::{CFString, CFStringRef};
-use objc2_app_kit::{NSColor, NSCursor, NSView, NSWindowCollectionBehavior, NSWindowStyleMask};
+use objc2_app_kit::{
+    NSColor, NSCursor, NSScreen, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
+};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::application::ApplicationHandler;
+use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::window::{Fullscreen, Window, WindowId, WindowLevel};
+use winit::monitor::MonitorHandle;
+use winit::platform::macos::MonitorHandleExtMacOS;
+use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::RunArgs;
 use crate::compositor::Compositor;
@@ -164,50 +169,60 @@ fn display_sleep_inhibited() -> bool {
     inhibited
 }
 
-/// Turn the winit window (already placed on its monitor by `Fullscreen::Borderless`)
-/// into a full-display screen-saver overlay via the underlying NSWindow: borderless
-/// and sized to the whole screen frame at screen-saver level (drawing over the menu
-/// bar and Dock), visible on all Spaces, opaque black.
-fn configure_saver_window(window: &Window) {
-    let Ok(handle) = window.window_handle() else {
-        return;
-    };
+/// Turn the freshly-created winit window into a full-display screen-saver overlay via
+/// the underlying NSWindow: borderless, sized to the target display's whole frame at
+/// screen-saver level (drawing over the menu bar and Dock), visible on all Spaces,
+/// opaque black. Returns the display's physical pixel size for the GPU surface.
+///
+/// We place and size the window ourselves from the monitor's `NSScreen` rather than
+/// using winit fullscreen: `Fullscreen::Borderless` routes through
+/// `-[NSWindow toggleFullScreen:]`, entering a native fullscreen Space whose
+/// `_NSFullScreenSpace` segfaults on teardown once the window is re-styled (winit
+/// #2645). A plain borderless window at screen-saver level never creates one.
+fn configure_saver_window(window: &Window, monitor: &MonitorHandle) -> Option<PhysicalSize<u32>> {
+    let handle = window.window_handle().ok()?;
     let RawWindowHandle::AppKit(appkit) = handle.as_raw() else {
-        return;
+        return None;
     };
-    // SAFETY: winit hands us a live NSView pointer for this window.
+    // SAFETY: winit hands us a live NSView pointer for this window, and the monitor's
+    // NSScreen pointer is valid for this synchronous use.
     unsafe {
         let ns_view: &NSView = &*appkit.ns_view.as_ptr().cast::<NSView>();
-        if let Some(ns_window) = ns_view.window() {
-            ns_window.setLevel(1000); // NSScreenSaverWindowLevel
-            ns_window.setCollectionBehavior(
-                NSWindowCollectionBehavior::CanJoinAllSpaces
-                    | NSWindowCollectionBehavior::Stationary
-                    | NSWindowCollectionBehavior::FullScreenAuxiliary,
-            );
-            // Fullscreen::Borderless placed the window on the right monitor (so
-            // screen() is correct here) but left it a *titled* window, which macOS
-            // clamps to the visibleFrame — a titled window can't cover the menu
-            // bar, so setFrame to the full frame was silently shrunk. Make it
-            // borderless first (lifts the clamp and removes the title bar), then
-            // size it to the full screen frame. Overscan a couple points so HiDPI
-            // rounding can't leave a seam; the excess is clipped off-screen.
-            if let Some(screen) = ns_window.screen() {
-                let mut frame = screen.frame();
-                frame.origin.x -= 2.0;
-                frame.origin.y -= 2.0;
-                frame.size.width += 4.0;
-                frame.size.height += 4.0;
-                ns_window.setStyleMask(NSWindowStyleMask::Borderless);
-                ns_window.setFrame_display(frame, true);
-            }
-            // Paint the window black (drop the shadow) so any margin the GPU
-            // surface doesn't cover reads black, not grey.
-            ns_window.setOpaque(true);
-            ns_window.setHasShadow(false);
-            ns_window.setBackgroundColor(Some(&*NSColor::blackColor()));
-            ns_window.orderFrontRegardless();
-        }
+        let ns_window = ns_view.window()?;
+        // Borderless first: removes the title bar and lifts AppKit's clamp of a
+        // titled window to the visibleFrame, so the frame below can cover the menu
+        // bar and Dock.
+        ns_window.setStyleMask(NSWindowStyleMask::Borderless);
+        ns_window.setLevel(1000); // NSScreenSaverWindowLevel (above the menu bar/Dock)
+        ns_window.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::Stationary
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        // Place/size the window on the target display from its NSScreen frame (global
+        // AppKit points, bottom-left origin — DPI-independent). winit's `with_position`
+        // is unreliable across mixed-DPI displays, so we go straight to the NSScreen.
+        // Overscan a couple points so HiDPI rounding can't leave a seam; the excess is
+        // clipped off-screen.
+        let size = monitor.ns_screen().map(|ptr| {
+            let ns_screen: &NSScreen = &*ptr.cast::<NSScreen>();
+            let mut frame = ns_screen.frame();
+            let scale = ns_screen.backingScaleFactor();
+            let (w, h) = (frame.size.width, frame.size.height);
+            frame.origin.x -= 2.0;
+            frame.origin.y -= 2.0;
+            frame.size.width += 4.0;
+            frame.size.height += 4.0;
+            ns_window.setFrame_display(frame, true);
+            PhysicalSize::new((w * scale).round() as u32, (h * scale).round() as u32)
+        });
+        // Paint the window black and drop the shadow — the shadow is the thin grey
+        // edge line on modern macOS, and black covers any margin the GPU misses.
+        ns_window.setOpaque(true);
+        ns_window.setHasShadow(false);
+        ns_window.setBackgroundColor(Some(&*NSColor::blackColor()));
+        ns_window.orderFrontRegardless();
+        size
     }
 }
 
@@ -412,16 +427,15 @@ impl MacApp {
         }
 
         for monitor in monitors {
-            // Fullscreen-borderless on this specific monitor. winit's
-            // `with_position` is unreliable across mixed-DPI displays — the
-            // external monitor's coordinates fall inside the primary's physical
-            // bounds, so the window never leaves the primary — whereas the monitor
-            // handle targets the right display directly. configure_saver_window
-            // then snaps it to the (now correct) screen frame at screen-saver
-            // level. Failures skip the display instead of aborting the process.
+            // Plain undecorated window — NOT winit fullscreen. `Fullscreen::Borderless`
+            // enters a native fullscreen Space whose `_NSFullScreenSpace` segfaults on
+            // teardown once we re-style the window (see configure_saver_window).
+            // configure_saver_window then makes it a borderless screen-saver-level
+            // window placed on this monitor's NSScreen. Failures skip the display
+            // instead of aborting the process.
             let attrs = Window::default_attributes()
                 .with_title("olsvr")
-                .with_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
+                .with_decorations(false);
             let window = match event_loop.create_window(attrs) {
                 Ok(w) => Arc::new(w),
                 Err(e) => {
@@ -430,9 +444,9 @@ impl MacApp {
                 }
             };
             window.set_window_level(WindowLevel::AlwaysOnTop);
-            configure_saver_window(&window);
+            let size =
+                configure_saver_window(&window, &monitor).unwrap_or_else(|| window.inner_size());
 
-            let size = window.inner_size();
             let surface = match instance.create_surface(window.clone()) {
                 Ok(s) => s,
                 Err(e) => {
@@ -470,7 +484,7 @@ impl MacApp {
         // hiding only takes effect while the app holds focus. An LSUIElement app
         // has no Dock icon, so activating costs nothing visible. (The earlier
         // "activation breaks multi-display" was really the with_position bug,
-        // since fixed by Fullscreen::Borderless.)
+        // since fixed by placing each window on its monitor's NSScreen.)
         // SAFETY: main thread; NSApplication is the live singleton.
         unsafe {
             let app: *mut objc2::runtime::AnyObject =

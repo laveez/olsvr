@@ -338,6 +338,7 @@ pub fn run(args: RunArgs) {
         debug: args.debug,
         cursor_hidden: false,
         watchdog,
+        hidden_at: None,
     };
     event_loop
         .run_app(&mut app)
@@ -363,6 +364,7 @@ struct MacApp {
     debug: bool,
     cursor_hidden: bool,
     watchdog: Arc<Watchdog>,
+    hidden_at: Option<Instant>,
 }
 
 impl MacApp {
@@ -512,6 +514,18 @@ impl MacApp {
             show_cursor();
             self.cursor_hidden = false;
         }
+        self.hidden_at = Some(Instant::now());
+    }
+
+    /// True once a full idle period has passed since the saver was last dismissed.
+    ///
+    /// `CGEventSourceSecondsSinceLastEventType` trails the input winit delivers by
+    /// up to a second, so the reading taken right after a dismiss is still the
+    /// stale pre-input value — well past the timeout. Without this gate the very
+    /// next poll re-shows the saver milliseconds after the dismiss, and only a
+    /// second mouse move (by which time the counter has caught up) gets rid of it.
+    fn idle_cycle_elapsed(&self) -> bool {
+        self.hidden_at.is_none_or(|t| t.elapsed() >= self.timeout)
     }
 }
 
@@ -547,7 +561,11 @@ impl ApplicationHandler for MacApp {
         // accessory, so they don't always get key/mouse events themselves.
         let idle = idle_seconds();
         let showing = !self.targets.is_empty();
-        if !showing && idle >= self.timeout.as_secs_f64() && !display_sleep_inhibited() {
+        if !showing
+            && idle >= self.timeout.as_secs_f64()
+            && self.idle_cycle_elapsed()
+            && !display_sleep_inhibited()
+        {
             // Skip activation while another app holds a display-sleep assertion
             // (video playback, presentations) so the saver doesn't cover it.
             self.on_event(BackendEvent::Idle, event_loop);

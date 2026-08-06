@@ -236,17 +236,21 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// isn't dismissed by the keystroke that launched it.
 const DISMISS_IDLE_SECS: f64 = 0.5;
 
-/// If the render loop goes this long without drawing a frame while the saver is
-/// active, the watchdog force-exits to release the screen.
+/// If the render loop goes this long without completing a frame while the saver
+/// is active, the watchdog force-exits to release the screen.
 const WATCHDOG_STALL: Duration = Duration::from_secs(5);
 
 /// Safety net against a trapped screen. The saver window sits at screen-saver
 /// level above everything, so if the render/event loop ever stalls (e.g. a GPU
 /// surface call blocking on a display glitch) the black window would be left with
-/// no way to dismiss it. This separate thread force-exits if no frame is drawn
-/// for `WATCHDOG_STALL` while active. A clean `exit(0)` lets the display recover
-/// and, because the launchd agent's KeepAlive only restarts on failure, does not
-/// relaunch into another black-out.
+/// no way to dismiss it. This separate thread force-exits if the loop completes
+/// no frame for `WATCHDOG_STALL` while active.
+///
+/// Exiting non-zero is deliberate: the launchd agent's KeepAlive only restarts on
+/// failure, so a clean exit would leave the saver silently dead until the user
+/// noticed. The relaunch is bounded — `ThrottleInterval` delays it and the new
+/// process starts dormant, needing a full idle timeout before it can activate
+/// again — so even a deterministic hang costs a brief flash, not a lockout.
 struct Watchdog {
     start: Instant,
     last_beat_ms: AtomicU64,
@@ -262,7 +266,7 @@ impl Watchdog {
         })
     }
 
-    /// Record that a frame was just drawn.
+    /// Record that the render loop just completed a pass.
     fn beat(&self) {
         self.last_beat_ms
             .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -290,10 +294,10 @@ impl Watchdog {
                 let since_beat = elapsed.saturating_sub(wd.last_beat_ms.load(Ordering::Relaxed));
                 if since_beat > stall_ms {
                     log::error!(
-                        "watchdog: render stalled {since_beat}ms while active — exiting to release the display"
+                        "watchdog: render stalled {since_beat}ms while active — exiting to release the display (launchd will restart)"
                     );
                     let _ = std::fs::remove_file(crate::pid_path());
-                    std::process::exit(0);
+                    std::process::exit(1);
                 }
             }
         });
@@ -586,13 +590,18 @@ impl ApplicationHandler for MacApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let mut drew = false;
+                let mut rendered = false;
                 if let Some(t) = self.target_mut(id) {
-                    drew = t.compositor.render_frame(None);
+                    t.compositor.render_frame(None);
                     // Continuous animation: request the next frame for this window.
                     t.window.request_redraw();
+                    rendered = true;
                 }
-                if drew {
+                // Any completed render is a heartbeat: the watchdog exists to catch
+                // a hung loop, and a skipped frame (occluded surface, sleeping
+                // display) means there is nothing to draw, not that a black window
+                // is trapping the screen.
+                if rendered {
                     self.watchdog.beat();
                 }
             }

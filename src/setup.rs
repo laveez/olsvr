@@ -6,10 +6,7 @@ use crate::config::Config;
 use crate::pid_path;
 
 fn stop_existing() {
-    // Stop systemd service if running
-    let _ = Command::new("systemctl")
-        .args(["--user", "stop", "olsvr.service"])
-        .output();
+    stop_autostart_service();
 
     // Kill any process from the PID file
     let path = pid_path();
@@ -21,21 +18,44 @@ fn stop_existing() {
     }
 }
 
+/// Stop a previously-installed autostart unit so it can't restart mid-setup.
+#[cfg(target_os = "linux")]
+fn stop_autostart_service() {
+    let _ = Command::new("systemctl")
+        .args(["--user", "stop", "olsvr.service"])
+        .output();
+}
+
+#[cfg(target_os = "macos")]
+fn stop_autostart_service() {
+    let uid = unsafe { libc::getuid() };
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("gui/{uid}/{}", crate::LAUNCHD_LABEL)])
+        .output();
+}
+
+/// Warn about a missing display server (Wayland-only; no-op on macOS).
+#[cfg(target_os = "linux")]
+fn check_prerequisites() {
+    if std::env::var("WAYLAND_DISPLAY").is_err() {
+        eprintln!("Warning: WAYLAND_DISPLAY not set. olsvr requires a Wayland session.");
+        println!();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn check_prerequisites() {}
+
 pub fn run() {
     let theme = ColorfulTheme::default();
 
     println!();
     println!("  olsvr setup");
-    println!("  OLED screensaver for Wayland");
+    println!("  OLED screensaver");
     println!();
 
     stop_existing();
-
-    // Check prerequisites
-    if std::env::var("WAYLAND_DISPLAY").is_err() {
-        eprintln!("Warning: WAYLAND_DISPLAY not set. olsvr requires a Wayland session.");
-        println!();
-    }
+    check_prerequisites();
 
     let mut config = if Config::exists() {
         println!("  Found existing config at {}", Config::path().display());
@@ -122,18 +142,7 @@ pub fn run() {
         }
     }
 
-    // Systemd install
-    println!();
-    let install = Select::with_theme(&theme)
-        .with_prompt("Install as systemd user service?")
-        .items(["Yes", "No"])
-        .default(0)
-        .interact()
-        .unwrap();
-
-    if install == 0 {
-        install_systemd_service();
-    }
+    offer_autostart_install(&theme);
 
     println!();
     println!("  Setup complete!");
@@ -413,6 +422,35 @@ fn rebuild_layers(config: &mut Config) {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn offer_autostart_install(theme: &ColorfulTheme) {
+    println!();
+    let install = Select::with_theme(theme)
+        .with_prompt("Install as systemd user service?")
+        .items(["Yes", "No"])
+        .default(0)
+        .interact()
+        .unwrap();
+    if install == 0 {
+        install_systemd_service();
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn offer_autostart_install(theme: &ColorfulTheme) {
+    println!();
+    let install = Select::with_theme(theme)
+        .with_prompt("Install as a login agent (launchd, no Dock icon)?")
+        .items(["Yes", "No"])
+        .default(0)
+        .interact()
+        .unwrap();
+    if install == 0 {
+        install_launchd_agent();
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn install_systemd_service() {
     let home = std::env::var("HOME").expect("HOME not set");
     let service_dir = format!("{home}/.config/systemd/user");
@@ -477,4 +515,163 @@ fn install_systemd_service() {
         .status();
 
     println!("  Service enabled and started.");
+}
+
+/// Wrap the installed binary in a minimal `olsvr.app` whose `Info.plist` sets
+/// `LSUIElement` so the login agent runs without a Dock icon. Returns the path
+/// to the executable inside the bundle, or `None` if the bundle couldn't be made
+/// (the caller then falls back to the bare binary).
+#[cfg(target_os = "macos")]
+fn create_app_bundle() -> Option<String> {
+    let home = std::env::var("HOME").ok()?;
+    let app_dir = format!("{home}/Applications/olsvr.app");
+    let macos_dir = format!("{app_dir}/Contents/MacOS");
+    let exe_dst = format!("{macos_dir}/olsvr");
+    let info_dst = format!("{app_dir}/Contents/Info.plist");
+
+    if let Err(e) = std::fs::create_dir_all(&macos_dir) {
+        eprintln!("Failed to create {macos_dir}: {e}");
+        return None;
+    }
+
+    // Copy (not symlink) so the bundle is self-contained and LaunchServices reads
+    // its Info.plist; re-run setup after upgrading to refresh the copy.
+    let src = std::env::current_exe().ok()?;
+    if let Err(e) = std::fs::copy(&src, &exe_dst) {
+        eprintln!("Failed to copy binary into app bundle: {e}");
+        return None;
+    }
+
+    let info = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key>
+  <string>{label}</string>
+  <key>CFBundleName</key>
+  <string>olsvr</string>
+  <key>CFBundleExecutable</key>
+  <string>olsvr</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+</dict>
+</plist>
+"#,
+        label = crate::LAUNCHD_LABEL,
+    );
+    if let Err(e) = std::fs::write(&info_dst, info) {
+        eprintln!("Failed to write app Info.plist: {e}");
+        return None;
+    }
+
+    // Ad-hoc codesign the bundle. The linker's signature on the bare binary fails
+    // validation once it is a bundle's main executable, so the agent gets
+    // AMFI-killed at launch (SIGKILL, OS_REASON_CODESIGNING) unless re-signed in
+    // the bundle context.
+    let signed = Command::new("codesign")
+        .args(["--force", "--sign", "-", &app_dir])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !signed {
+        eprintln!(
+            "Warning: codesign failed for {app_dir}; the login agent may be killed at launch"
+        );
+    }
+
+    println!("  Created app bundle at {app_dir}");
+    Some(exe_dst)
+}
+
+#[cfg(target_os = "macos")]
+fn install_launchd_agent() {
+    let home = std::env::var("HOME").expect("HOME not set");
+    let label = crate::LAUNCHD_LABEL;
+    let agents_dir = format!("{home}/Library/LaunchAgents");
+    let plist_path = format!("{agents_dir}/{label}.plist");
+
+    if let Err(e) = std::fs::create_dir_all(&agents_dir) {
+        eprintln!("Failed to create {agents_dir}: {e}");
+        return;
+    }
+
+    // Launch from the LSUIElement app bundle so the agent has no Dock icon; fall
+    // back to the bare installed binary if the bundle couldn't be created.
+    let exe = create_app_bundle().unwrap_or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|p| p.to_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{home}/.cargo/bin/olsvr"))
+    });
+
+    // KeepAlive only on crash (SuccessfulExit=false) mirrors systemd Restart=on-failure,
+    // so a clean `olsvr stop` / bootout stays stopped.
+    let plist = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{exe}</string>
+    <string>run</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ProcessType</key>
+  <string>Interactive</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>RUST_LOG</key>
+    <string>info</string>
+  </dict>
+  <key>StandardOutPath</key>
+  <string>{home}/Library/Logs/olsvr.log</string>
+  <key>StandardErrorPath</key>
+  <string>{home}/Library/Logs/olsvr.log</string>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+</dict>
+</plist>
+"#
+    );
+
+    if let Err(e) = std::fs::write(&plist_path, plist) {
+        eprintln!("Failed to write launchd plist: {e}");
+        return;
+    }
+    println!("  Installed agent to {plist_path}");
+
+    // Reload: bootout any previous instance, then bootstrap into the GUI domain.
+    let uid = unsafe { libc::getuid() };
+    let domain = format!("gui/{uid}");
+    let _ = Command::new("launchctl")
+        .args(["bootout", &format!("{domain}/{label}")])
+        .output();
+    let bootstrapped = Command::new("launchctl")
+        .args(["bootstrap", &domain, &plist_path])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !bootstrapped {
+        // Older macOS without `bootstrap`: fall back to legacy load.
+        let _ = Command::new("launchctl")
+            .args(["load", "-w", &plist_path])
+            .status();
+    }
+    println!("  Agent enabled and started.");
 }

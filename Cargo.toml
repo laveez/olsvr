@@ -2,22 +2,17 @@
 name = "olsvr"
 version = "0.2.1"
 edition = "2024"
-description = "OLED screensaver for Wayland"
+description = "OLED screensaver for Wayland and macOS"
 license = "MIT"
 repository = "https://github.com/laveez/olsvr"
 homepage = "https://github.com/laveez/olsvr"
 readme = "README.md"
-keywords = ["wayland", "screensaver", "oled", "burn-in"]
+keywords = ["wayland", "macos", "screensaver", "oled", "burn-in"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-smithay-client-toolkit = "0.20"
-wayland-client = "0.31"
-wayland-backend = { version = "0.3", features = ["client_system"] }
-wayland-protocols = { version = "0.32", features = ["client", "staging"] }
 wgpu = "29"
 glyphon = "0.11"
-calloop = { version = "0.14", features = ["signals"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"
@@ -27,8 +22,23 @@ pollster = "0.4"
 serde = { version = "1", features = ["derive"] }
 toml = "1.0"
 dialoguer = "0.12"
-dbus = "0.9"
 ureq = "3"
 quick-xml = "0.39"
 log = "0.4"
 env_logger = "0.11"
+
+# Linux/Wayland backend dependencies — only compiled on Linux so the crate
+# builds on macOS (where the backend is winit/Cocoa, added in a later phase).
+[target.'cfg(target_os = "linux")'.dependencies]
+smithay-client-toolkit = "0.20"
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+calloop = { version = "0.14", features = ["signals"] }
+dbus = "0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+winit = "0.30"
+core-foundation = "0.10"
+objc2 = "0.5"
+objc2-app-kit = "0.2"

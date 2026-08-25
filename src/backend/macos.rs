@@ -343,6 +343,7 @@ pub fn run(args: RunArgs) {
         cursor_hidden: false,
         watchdog,
         hidden_at: None,
+        show_failures: 0,
     };
     event_loop
         .run_app(&mut app)
@@ -369,6 +370,8 @@ struct MacApp {
     cursor_hidden: bool,
     watchdog: Arc<Watchdog>,
     hidden_at: Option<Instant>,
+    /// Consecutive failed show attempts, for log throttling.
+    show_failures: u32,
 }
 
 impl MacApp {
@@ -376,7 +379,16 @@ impl MacApp {
     fn apply(&mut self, cmds: Vec<EngineCommand>, event_loop: &ActiveEventLoop) {
         for cmd in cmds {
             match cmd {
-                EngineCommand::Show { .. } => self.show(event_loop),
+                EngineCommand::Show { .. } => {
+                    if !self.show(event_loop) {
+                        // Tell the Engine the show produced nothing, so it returns to
+                        // Dormant instead of latching Active with no windows (and no
+                        // input path that could ever dismiss it). The resulting Hide
+                        // sets `hidden_at`, pacing retries to one per idle cycle.
+                        let cmds = self.engine.handle(BackendEvent::ShowFailed, Instant::now());
+                        self.apply(cmds, event_loop);
+                    }
+                }
                 EngineCommand::Hide => self.hide(),
                 EngineCommand::SetKeepAwake(true) => {
                     if self.keep_awake_id.is_none() {
@@ -401,9 +413,10 @@ impl MacApp {
         self.apply(cmds, event_loop);
     }
 
-    fn show(&mut self, event_loop: &ActiveEventLoop) {
+    /// Returns false when no saver window could be created on any display.
+    fn show(&mut self, event_loop: &ActiveEventLoop) -> bool {
         if !self.targets.is_empty() {
-            return;
+            return true;
         }
 
         // Start the weather fetch thread once if a weather layer is configured.
@@ -480,10 +493,27 @@ impl MacApp {
         }
 
         if self.targets.is_empty() {
-            // Nothing came up — disarm so the watchdog doesn't fire while dormant.
-            log::error!("No saver windows could be created; staying dormant");
+            // Nothing came up (e.g. zero attached displays) — disarm so the watchdog
+            // doesn't fire while dormant. First failure at error, repeats at debug so
+            // an unattended weekend doesn't fill the log.
+            if self.show_failures == 0 {
+                log::error!("No saver windows could be created; will retry next idle cycle");
+            } else {
+                log::debug!(
+                    "Saver window creation failed again ({} consecutive)",
+                    self.show_failures + 1
+                );
+            }
+            self.show_failures += 1;
             self.watchdog.set_active(false);
-            return;
+            return false;
+        }
+        if self.show_failures > 0 {
+            log::info!(
+                "Saver windows created again after {} failed attempts",
+                self.show_failures
+            );
+            self.show_failures = 0;
         }
 
         // Activate the app so the cursor hide reaches every display — cursor
@@ -504,6 +534,7 @@ impl MacApp {
             hide_cursor();
             self.cursor_hidden = true;
         }
+        true
     }
 
     fn target_mut(&mut self, id: WindowId) -> Option<&mut DisplayTarget> {

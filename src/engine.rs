@@ -19,6 +19,10 @@ pub enum BackendEvent {
     #[allow(dead_code)]
     Resume,
     DismissInput,
+    /// The backend could not create any saver surface for a `Show` (e.g. zero
+    /// attached displays). Emitted only by the macOS backend.
+    #[allow(dead_code)]
+    ShowFailed,
     ActivateSignal,
     /// Reserved graceful-shutdown event; no backend emits it yet.
     #[allow(dead_code)]
@@ -111,6 +115,9 @@ impl Engine {
     pub fn handle(&mut self, ev: BackendEvent, now: Instant) -> Vec<EngineCommand> {
         match ev {
             BackendEvent::Idle | BackendEvent::ActivateSignal => self.activate(now),
+            // No surface exists, so the grace periods (which guard a *visible*
+            // saver against its own activation side effects) must not apply.
+            BackendEvent::ShowFailed => self.deactivate(),
             BackendEvent::Resume => {
                 if let State::Active { activated_at } = self.state
                     && now.duration_since(activated_at) < RESUME_GRACE
@@ -212,5 +219,38 @@ mod tests {
         let cmds = e.handle(BackendEvent::DismissInput, now + Duration::from_secs(2));
         assert!(cmds.contains(&EngineCommand::Hide));
         assert!(cmds.contains(&EngineCommand::SetKeepAwake(false)));
+    }
+
+    #[test]
+    fn show_failed_returns_to_dormant_immediately_despite_grace() {
+        let mut e = eng(DisplayScope::All, KeepAwake::WhileActive, &[1]);
+        let now = Instant::now();
+        e.handle(BackendEvent::Idle, now);
+        // Reported right after Show, well inside the dismiss grace — must not be ignored.
+        let cmds = e.handle(BackendEvent::ShowFailed, now);
+        assert!(cmds.contains(&EngineCommand::Hide));
+        assert!(cmds.contains(&EngineCommand::SetKeepAwake(false)));
+    }
+
+    #[test]
+    fn idle_can_reactivate_after_show_failed() {
+        let mut e = eng(DisplayScope::All, KeepAwake::WhileActive, &[1, 2]);
+        let now = Instant::now();
+        e.handle(BackendEvent::Idle, now);
+        e.handle(BackendEvent::ShowFailed, now);
+        let cmds = e.handle(BackendEvent::Idle, now + Duration::from_secs(1));
+        assert_eq!(
+            cmds[0],
+            EngineCommand::Show {
+                displays: vec![1, 2]
+            }
+        );
+    }
+
+    #[test]
+    fn show_failed_while_dormant_is_a_no_op() {
+        let mut e = eng(DisplayScope::All, KeepAwake::WhileActive, &[1]);
+        let cmds = e.handle(BackendEvent::ShowFailed, Instant::now());
+        assert!(cmds.is_empty());
     }
 }

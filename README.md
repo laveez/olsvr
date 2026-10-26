@@ -30,15 +30,15 @@ olsvr prevents OLED burn-in by displaying a fading clock that periodically repos
 - **Idle detection** — `ext-idle-notify-v1` or D-Bus (GNOME) on Wayland, CoreGraphics event idle on macOS, after a configurable timeout
 - **Fade animation** — clock fades in, holds, fades out, then teleports to a new position
 - **Quadrant-aware repositioning** — never lands in the same screen quadrant twice in a row
-- **Multi-display** — cover just the primary display or every connected display
+- **Multi-display** — cover just the primary display or every connected display (macOS)
 - **Weather overlay** — colored Nerd Font weather icons with temperature and wind speed via [FMI Open Data](https://en.ilmatieteenlaitos.fi/open-data)
 - **GPU-accelerated** — wgpu + glyphon text rendering (Vulkan on Wayland, Metal on macOS)
 - **Configurable** — font, size, color, timing, date/time format, activation policy via `~/.olsvr.toml`
 - **Interactive setup wizard** — `olsvr setup` walks through configuration with a live preview
 - **Autostart** — installs a systemd user service (Linux) or a launchd login agent with no Dock icon (macOS)
-- **Keep-awake** — holds a display-sleep inhibitor while active, or for the whole session (Wayland idle-inhibit / macOS `IOPMAssertion`)
+- **Keep-awake** — holds a display-sleep inhibitor while active (Wayland idle-inhibit / macOS `IOPMAssertion`), or for the whole session, released while it is locked (macOS and GNOME)
 - **Manual trigger** — `olsvr run --activate` signals a running instance to show now (Wayland)
-- **Video-aware** — respects screensaver inhibitors such as video playback (Wayland)
+- **Video-aware** — respects screensaver inhibitors such as video playback (Wayland) and display-sleep assertions such as those from Chrome and Firefox (macOS)
 - **Input dismissal** — any key press or mouse movement deactivates immediately
 
 ---
@@ -55,7 +55,7 @@ olsvr setup
 # Or run directly with defaults
 olsvr run
 
-# Trigger a running instance to show immediately
+# Trigger a running instance to show immediately (Linux only)
 olsvr run --activate
 
 # Preview the screensaver (shows instantly, dismiss with any input)
@@ -66,6 +66,8 @@ olsvr stop
 ```
 
 > **macOS:** if `olsvr` isn't found after `cargo install`, add `~/.cargo/bin` to your `PATH` — rustup does this automatically, but Homebrew's cargo does not.
+>
+> **macOS:** `olsvr stop` is how to stop the login agent; if the process quits any other way, launchd restarts it.
 
 ---
 
@@ -162,7 +164,7 @@ CLI flags override config file values for the current run.
 | `--fade-duration <MS>` | Fade in/out duration |
 | `--edge-padding <PIXELS>` | Minimum distance from screen edges |
 | `--now` | Show immediately, skip idle wait |
-| `--activate` | Send SIGUSR1 to a running instance |
+| `--activate` | Send SIGUSR1 to a running instance (Linux only) |
 | `--debug` | Show debug overlay (frame count, timing) |
 
 ---
@@ -172,7 +174,7 @@ CLI flags override config file values for the current run.
 ```mermaid
 stateDiagram-v2
     [*] --> Idle: Launch
-    Idle --> FadeIn: Idle timeout / SIGUSR1
+    Idle --> FadeIn: Idle timeout / SIGUSR1 (Linux)
     FadeIn --> Hold: Fade complete
     Hold --> FadeOut: Hold duration elapsed
     FadeOut --> FadeIn: Repositioned
@@ -188,7 +190,7 @@ The animation cycle runs continuously while the screensaver is active:
 3. **Fade out** — opacity drops back to 0
 4. **Reposition** — clock teleports to a new quadrant (never the same one twice in a row)
 
-The screensaver creates a fullscreen black surface on each target display — a Wayland window on Linux, or a borderless `NSWindow` at screen-saver level on macOS. A display-sleep inhibitor keeps the panel awake while active. Any keyboard or mouse input dismisses it immediately.
+The screensaver creates a fullscreen black surface: on Linux, one Wayland window on the output the compositor chooses; on macOS, a borderless `NSWindow` at screen-saver level on each target display. A display-sleep inhibitor keeps the panel awake while active. Any keyboard or mouse input dismisses it immediately.
 
 ---
 
@@ -205,8 +207,8 @@ The screensaver creates a fullscreen black surface on each target display — a 
 
 **macOS:**
 
-- macOS 11 (Big Sur) or newer — renders with Metal via wgpu
-- No extra dependencies
+- macOS 11 (Big Sur) or newer, tested on macOS 26 and 27 — renders with Metal via wgpu
+- Xcode Command Line Tools for the C compiler and linker (`xcode-select --install`)
 
 > On Wayland, idle detection uses `ext-idle-notify-v1` (Sway, Hyprland) with an automatic D-Bus fallback for GNOME/Mutter, plus a manual `olsvr run --activate` trigger. On macOS, idle is polled from CoreGraphics and the login agent runs without a Dock icon.
 
@@ -219,7 +221,7 @@ Contributions are welcome! Open an issue or submit a PR.
 ```bash
 git clone https://github.com/laveez/olsvr.git
 cd olsvr
-git config core.hooksPath .githooks  # Enable pre-push fmt/clippy checks
+git config core.hooksPath .githooks  # Enable pre-push fmt/clippy/test checks
 cargo build
 cargo run -- run --now               # Preview the screensaver
 cargo run -- run --now --debug       # Preview with debug overlay

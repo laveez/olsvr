@@ -1,9 +1,9 @@
 //! Platform-agnostic screensaver state machine.
 //!
-//! The `Engine` turns backend events (idle, resume, input, signals, display
-//! changes) into commands the backend executes (show/hide surfaces, hold or
-//! release the keep-awake assertion, quit). It owns the activation policy and
-//! the dismiss/resume grace periods, and has no dependency on any windowing
+//! The `Engine` turns backend events (idle, resume, input, signals) into
+//! commands the backend executes (show/hide surfaces, hold or release the
+//! keep-awake assertion, quit). It owns the activation policy and the
+//! dismiss/resume grace periods, and has no dependency on any windowing
 //! system, so it is unit-tested without a display.
 
 use std::time::{Duration, Instant};

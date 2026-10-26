@@ -613,7 +613,7 @@ fn install_launchd_agent() {
 
     // KeepAlive true: launchd respawns the agent after any exit, so a quit event cannot
     // leave it dead; respawns are at least ThrottleInterval apart. `olsvr stop` and
-    // setup still stop it for good because both run `launchctl bootout` first.
+    // setup still stop it because both run `launchctl bootout` first.
     let plist = format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

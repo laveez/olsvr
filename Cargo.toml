@@ -27,8 +27,9 @@ quick-xml = "0.39"
 log = "0.4"
 env_logger = "0.11"
 
-# Linux/Wayland backend dependencies — only compiled on Linux so the crate
-# builds on macOS (where the backend is winit/Cocoa, added in a later phase).
+# Linux/Wayland backend dependencies, only compiled on Linux so the crate
+# builds on macOS. The macOS backend uses winit/Cocoa; see the macos target
+# section below.
 [target.'cfg(target_os = "linux")'.dependencies]
 smithay-client-toolkit = "0.20"
 wayland-client = "0.31"

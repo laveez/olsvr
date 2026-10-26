@@ -1,6 +1,6 @@
-//! Wayland (Linux) backend — moved verbatim from the original `main.rs`.
-//! The shared CLI and helpers (`Cli`, `RunArgs`, `pid_path`, `merge_cli`, `stop`,
-//! `main`) live in the crate root (`src/main.rs`). Compiled only on Linux.
+//! Wayland (Linux) backend, extracted from the original `main.rs` and driven through
+//! the `Engine`. The shared CLI and helpers (`Cli`, `RunArgs`, `pid_path`, `merge_cli`,
+//! `stop`, `main`) live in the crate root (`src/main.rs`). Compiled only on Linux.
 
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};

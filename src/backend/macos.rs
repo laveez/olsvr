@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use core_foundation::base::{CFGetTypeID, CFRange, TCFType};
+use core_foundation::base::{CFGetTypeID, TCFType};
 use core_foundation::boolean::{CFBoolean, CFBooleanRef};
 use core_foundation::number::{CFNumber, CFNumberRef};
-use core_foundation::string::{CFString, CFStringGetCharacters, CFStringGetLength, CFStringRef};
+use core_foundation::string::{CFString, CFStringRef};
 use objc2_app_kit::{
     NSColor, NSCursor, NSScreen, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
@@ -171,33 +171,27 @@ unsafe fn is_display_sleep_assertion(assertion: *const c_void) -> bool {
     }
 }
 
-/// `string` as UTF-8, with unpaired surrogates replaced by U+FFFD. `CFString`'s own
-/// `Display` panics on a string that does not convert to UTF-8, and the names we log
-/// come from other processes.
-fn lossy_string(string: &CFString) -> String {
-    let string_ref = string.as_concrete_TypeRef();
-    // SAFETY: `string_ref` is a live CFString, and `units` has room for the `length`
-    // UTF-16 units CFStringGetCharacters writes for the full range.
-    let units = unsafe {
-        let length = CFStringGetLength(string_ref).max(0);
-        let mut units = vec![0; length as usize];
-        let range = CFRange {
-            location: 0,
-            length,
-        };
-        CFStringGetCharacters(string_ref, range, units.as_mut_ptr());
-        units
-    };
-    String::from_utf16_lossy(&units)
+/// The name of process `pid`, or an empty string if it cannot be read, e.g. because the
+/// process has exited. `proc_name` returns the length of the name it copied, or 0 on
+/// failure, and fails unless the buffer can hold `pbi_name` of libproc's
+/// `struct proc_bsdinfo`, `2 * MAXCOMLEN` bytes.
+fn process_name(pid: i32) -> String {
+    let mut buffer = [0u8; 2 * libc::MAXCOMLEN];
+    // SAFETY: `buffer` is writable for the `buffer.len()` bytes passed, and proc_name never
+    // writes more than it is given.
+    let length = unsafe { libc::proc_name(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    let name = usize::try_from(length)
+        .ok()
+        .and_then(|length| buffer.get(..length));
+    String::from_utf8_lossy(name.unwrap_or_default()).into_owned()
 }
 
-/// The owning PID and `AssertName` (empty if it has none) of the first display-sleep
-/// assertion another app holds, e.g. a video player or presentation keeping the screen on.
-/// The macOS analog of the Wayland inhibitor gate (`idle_inhibited_by_others`), so the
-/// saver doesn't cover playing video. Our own keep-awake assertion (held under some
-/// `keep_awake` policies) is ignored by owning PID and by name, so a second olsvr instance
-/// doesn't count either.
-fn display_sleep_inhibited() -> Option<(i32, String)> {
+/// The PID that owns the first display-sleep assertion another app holds, e.g. a video
+/// player or presentation keeping the screen on. The macOS analog of the Wayland inhibitor
+/// gate (`idle_inhibited_by_others`), so the saver doesn't cover playing video. Our own
+/// keep-awake assertion (held under some `keep_awake` policies) is ignored by owning PID
+/// and by name, so a second olsvr instance doesn't count either.
+fn display_sleep_inhibited() -> Option<i32> {
     let own_pid = std::process::id() as i32;
 
     let mut by_pid: *const c_void = std::ptr::null();
@@ -236,8 +230,7 @@ fn display_sleep_inhibited() -> Option<(i32, String)> {
                 if name.as_ref().is_some_and(|name| *name == KEEP_AWAKE_NAME) {
                     continue;
                 }
-                let name = name.map(|name| lossy_string(&name)).unwrap_or_default();
-                inhibitor = Some((pid, name));
+                inhibitor = Some(pid);
                 break 'scan;
             }
         }
@@ -518,7 +511,9 @@ struct MacApp {
     hidden_at: Option<Instant>,
     /// Consecutive failed show attempts, for log throttling.
     show_failures: u32,
-    /// The other app found holding a display-sleep assertion at the last idle check, so
+    /// The PID and name of the app found holding a display-sleep assertion when the current
+    /// hold started; cleared by the first idle check that no longer finds one. The name is
+    /// looked up at the start, because the process may be gone when the hold ends. Kept so
     /// the log shows when a hold starts and ends rather than every poll.
     display_inhibitor: Option<(i32, String)>,
 }
@@ -747,17 +742,22 @@ impl MacApp {
     /// when a hold starts and ends. Only the idle check calls it, so an end is logged
     /// at the first idle check after the hold is gone, not when it is released.
     fn display_inhibited(&mut self) -> bool {
-        let inhibitor = display_sleep_inhibited();
-        match (&self.display_inhibitor, &inhibitor) {
-            (None, Some((pid, name))) => log::info!(
-                "Not activating while pid {pid} holds a display-sleep assertion named {name:?}"
-            ),
-            (Some((pid, name)), None) => log::info!(
-                "Display-sleep assertion of pid {pid} named {name:?} released, activation resumes"
-            ),
+        match (&self.display_inhibitor, display_sleep_inhibited()) {
+            (None, Some(pid)) => {
+                let app = process_name(pid);
+                log::info!(
+                    "Not activating while {app:?} (pid {pid}) holds a display-sleep assertion"
+                );
+                self.display_inhibitor = Some((pid, app));
+            }
+            (Some((pid, app)), None) => {
+                log::info!(
+                    "Display-sleep assertion of {app:?} (pid {pid}) no longer found, activation resumes"
+                );
+                self.display_inhibitor = None;
+            }
             _ => {}
         }
-        self.display_inhibitor = inhibitor;
         self.display_inhibitor.is_some()
     }
 }

@@ -23,6 +23,10 @@ pub enum BackendEvent {
     /// attached displays). Emitted only by the macOS backend.
     #[allow(dead_code)]
     ShowFailed,
+    /// The compositor or the user closed the saver surface. Emitted only by the
+    /// Wayland backend.
+    #[allow(dead_code)]
+    SurfaceClosed,
     ActivateSignal,
     /// Reserved graceful-shutdown event; no backend emits it yet.
     #[allow(dead_code)]
@@ -117,7 +121,7 @@ impl Engine {
             BackendEvent::Idle | BackendEvent::ActivateSignal => self.activate(now),
             // No surface exists, so the grace periods (which guard a *visible*
             // saver against its own activation side effects) must not apply.
-            BackendEvent::ShowFailed => self.deactivate(),
+            BackendEvent::ShowFailed | BackendEvent::SurfaceClosed => self.deactivate(),
             BackendEvent::Resume => {
                 if let State::Active { activated_at } = self.state
                     && now.duration_since(activated_at) < RESUME_GRACE

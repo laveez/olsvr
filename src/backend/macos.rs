@@ -409,7 +409,10 @@ impl MacApp {
     }
 
     fn on_event(&mut self, ev: BackendEvent, event_loop: &ActiveEventLoop) {
-        let cmds = self.engine.handle(ev, Instant::now());
+        let cmds = self.engine.handle(ev.clone(), Instant::now());
+        if cmds.contains(&EngineCommand::Hide) {
+            log::info!("Hide via {ev:?}");
+        }
         self.apply(cmds, event_loop);
     }
 

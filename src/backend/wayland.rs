@@ -235,7 +235,10 @@ impl App {
     }
 
     fn on_event(&mut self, ev: BackendEvent, qh: &QueueHandle<Self>) {
-        let cmds = self.engine.handle(ev, Instant::now());
+        let cmds = self.engine.handle(ev.clone(), Instant::now());
+        if cmds.contains(&EngineCommand::Hide) {
+            log::info!("Hide via {ev:?}");
+        }
         self.apply(cmds, qh);
     }
 
@@ -443,8 +446,8 @@ impl SeatHandler for App {
 }
 
 impl WindowHandler for App {
-    fn request_close(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _window: &Window) {
-        self.deactivate();
+    fn request_close(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, _window: &Window) {
+        self.on_event(BackendEvent::SurfaceClosed, qh);
     }
 
     fn configure(

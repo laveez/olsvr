@@ -46,7 +46,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
 
 use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
 
-use crate::compositor::{Compositor, DebugInfo};
+use crate::compositor::{Compositor, DebugInfo, FrameOutcome};
 use crate::config::{Config, KeepAwake};
 use crate::data::{self, DataCache};
 use crate::engine::{BackendEvent, Engine, EngineCommand};
@@ -436,7 +436,7 @@ impl App {
         }
     }
 
-    fn draw(&mut self, from_callback: bool) {
+    fn draw(&mut self, from_callback: bool) -> FrameOutcome {
         let debug_info = if self.debug {
             let frame_ms = self
                 .last_draw
@@ -460,7 +460,9 @@ impl App {
         if let Some(ref mut ss) = self.screensaver
             && let Some(ref mut comp) = ss.compositor
         {
-            comp.render_frame(debug_info.as_ref());
+            comp.render_frame(debug_info.as_ref())
+        } else {
+            FrameOutcome::Skipped
         }
     }
 }
@@ -1029,11 +1031,18 @@ pub fn run(args: RunArgs) {
                 .wl_surface()
                 .clone();
             let t1 = Instant::now();
-            app.draw(from_callback);
+            let outcome = app.draw(from_callback);
             let draw_ms = t1.elapsed().as_millis();
-            surface.frame(&qh, surface.clone());
-            surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-            surface.commit();
+            match outcome {
+                FrameOutcome::Presented => {
+                    surface.frame(&qh, surface.clone());
+                    surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
+                    surface.commit();
+                }
+                // No frame callback is requested, so the 100ms fallback retries.
+                FrameOutcome::Skipped => {}
+                FrameOutcome::Broken => app.on_event(BackendEvent::ShowFailed, &qh),
+            }
 
             if dispatch_ms > 50 || draw_ms > 50 {
                 log::warn!("Slow frame: dispatch={dispatch_ms}ms draw={draw_ms}ms");

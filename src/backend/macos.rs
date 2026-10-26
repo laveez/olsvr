@@ -23,7 +23,7 @@ use winit::platform::macos::MonitorHandleExtMacOS;
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::RunArgs;
-use crate::compositor::Compositor;
+use crate::compositor::{Compositor, FrameOutcome};
 use crate::config::{Config, DisplayScope};
 use crate::data::{self, DataCache};
 use crate::engine::{BackendEvent, Engine, EngineCommand};
@@ -624,20 +624,20 @@ impl ApplicationHandler for MacApp {
                 }
             }
             WindowEvent::RedrawRequested => {
-                let mut rendered = false;
-                if let Some(t) = self.target_mut(id) {
-                    t.compositor.render_frame(None);
-                    // Continuous animation: request the next frame for this window.
-                    t.window.request_redraw();
-                    rendered = true;
+                let Some(t) = self.target_mut(id) else {
+                    return;
+                };
+                if t.compositor.render_frame(None) == FrameOutcome::Broken {
+                    self.on_event(BackendEvent::ShowFailed, event_loop);
+                    return;
                 }
+                // Continuous animation: request the next frame for this window.
+                t.window.request_redraw();
                 // Any completed render is a heartbeat: the watchdog exists to catch
                 // a hung loop, and a skipped frame (occluded surface, sleeping
                 // display) means there is nothing to draw, not that a black window
                 // is trapping the screen.
-                if rendered {
-                    self.watchdog.beat();
-                }
+                self.watchdog.beat();
             }
             WindowEvent::KeyboardInput { .. }
             | WindowEvent::MouseInput { .. }

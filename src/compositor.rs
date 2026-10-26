@@ -1,5 +1,5 @@
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use glyphon::{Cache, FontSystem, Resolution, SwashCache, TextAtlas, TextRenderer, Viewport};
 
@@ -16,11 +16,29 @@ use std::ptr::NonNull;
 #[cfg(target_os = "linux")]
 use wayland_client::{Connection, Proxy, protocol::wl_surface::WlSurface};
 
+/// Longest animation step one frame advances, so the first frame after a long
+/// occlusion does not jump.
+const MAX_FRAME_DT_SECS: f32 = 0.25;
+/// Validation errors in a row, with no frame presented between them, after which
+/// the surface counts as broken.
+const MAX_VALIDATION_ERRORS: u32 = 3;
+const WARN_INTERVAL: Duration = Duration::from_secs(1);
+
 pub struct DebugInfo {
     pub frame_count: u64,
     pub frame_ms: u64,
     pub from_callback: bool,
     pub uptime_secs: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameOutcome {
+    Presented,
+    /// Nothing was drawn (timeout, occlusion, a transient validation error). Not a
+    /// failure: try again later.
+    Skipped,
+    /// The surface or device can no longer render. Backends answer with `ShowFailed`.
+    Broken,
 }
 
 pub struct Compositor {
@@ -41,6 +59,9 @@ pub struct Compositor {
     max_texture_dim: u32,
     skips: u32,
     last_skip_log: Instant,
+    validation_errors: u32,
+    last_validation_warn: Option<Instant>,
+    last_prepare_warn: Option<Instant>,
 }
 
 /// Scale `(w, h)` down proportionally so neither exceeds `max` (the GPU's max
@@ -55,6 +76,16 @@ fn clamp_to_max(w: u32, h: u32, max: u32) -> (u32, u32) {
         ((w as f64 * scale) as u32).clamp(1, max),
         ((h as f64 * scale) as u32).clamp(1, max),
     )
+}
+
+/// Rate limit for a warning that can repeat every frame: true at most once per
+/// `WARN_INTERVAL`, and then records the time in `last`.
+fn warning_due(last: &mut Option<Instant>) -> bool {
+    if last.is_some_and(|t| t.elapsed() < WARN_INTERVAL) {
+        return false;
+    }
+    *last = Some(Instant::now());
+    true
 }
 
 impl Compositor {
@@ -169,6 +200,9 @@ impl Compositor {
             max_texture_dim,
             skips: 0,
             last_skip_log: Instant::now(),
+            validation_errors: 0,
+            last_validation_warn: None,
+            last_prepare_warn: None,
         })
     }
 
@@ -226,9 +260,9 @@ impl Compositor {
         }
     }
 
-    /// Render one frame. Returns `true` if a frame was presented; `false` if it
-    /// was skipped (the macOS watchdog treats a run of `false` as a stall).
-    pub fn render_frame(&mut self, debug_info: Option<&DebugInfo>) -> bool {
+    /// Render one frame; skipped frames (timeout/occluded) are counted and logged at debug.
+    #[must_use]
+    pub fn render_frame(&mut self, debug_info: Option<&DebugInfo>) -> FrameOutcome {
         // Summarize skipped frames at most once per second (a brief burst at show time is normal).
         if self.skips > 0 && self.last_skip_log.elapsed().as_secs() >= 1 {
             log::debug!(
@@ -240,15 +274,56 @@ impl Compositor {
             self.skips = 0;
         }
         let now = Instant::now();
-        let dt = now.duration_since(self.last_frame).as_secs_f32();
+        let dt = now
+            .duration_since(self.last_frame)
+            .as_secs_f32()
+            .min(MAX_FRAME_DT_SECS);
         self.last_frame = now;
+        self.update_layers(dt, debug_info);
 
-        let w = self.config.width;
-        let h = self.config.height;
+        // Nothing may be written to the queue before the acquire: wgpu holds each write's
+        // staging buffer until the next submit, and a skipped frame never submits.
+        let t0 = Instant::now();
+        let (output, suboptimal) = match self.acquire() {
+            Ok(acquired) => acquired,
+            Err(outcome) => return outcome,
+        };
+        let texture_ms = t0.elapsed().as_millis();
 
-        // 1. Update all layers
+        let text_ready = self.upload_text();
+        let commands = self.encode_frame(&output.texture, text_ready);
+
+        let t1 = Instant::now();
+        self.queue.submit(Some(commands));
+        let submit_ms = t1.elapsed().as_millis();
+
+        let t2 = Instant::now();
+        output.present();
+        let present_ms = t2.elapsed().as_millis();
+
+        // Configuring while a texture acquired from this surface is alive panics in
+        // wgpu, so a suboptimal surface is reconfigured only after its frame is presented.
+        if suboptimal {
+            self.surface.configure(&self.device, &self.config);
+        }
+
+        if texture_ms > 50 || submit_ms > 50 || present_ms > 50 {
+            log::warn!(
+                "Render: texture={texture_ms}ms submit={submit_ms}ms present={present_ms}ms"
+            );
+        }
+
+        self.validation_errors = 0;
+        self.text_atlas.trim();
+        FrameOutcome::Presented
+    }
+
+    /// Advance the layers and shape their text. CPU only: `render_frame` relies on
+    /// nothing here reaching the GPU queue.
+    fn update_layers(&mut self, dt: f32, debug_info: Option<&DebugInfo>) {
+        let (w, h) = (self.config.width as f32, self.config.height as f32);
         for layer in &mut self.layers {
-            layer.update(dt, w as f32, h as f32);
+            layer.update(dt, w, h);
         }
 
         // Pass debug info to debug layer via data cache
@@ -263,24 +338,71 @@ impl Compositor {
             });
         }
 
-        // 2. Prepare text for all layers
         for layer in &mut self.layers {
             layer.prepare_text(&mut self.font_system);
         }
+    }
 
-        // 3. Collect all text areas
-        let text_areas: Vec<_> = self.layers.iter().flat_map(|l| l.text_areas()).collect();
+    /// The frame's texture, and whether the surface wants a reconfigure once the
+    /// texture is presented. `Err` carries the outcome of a frame that cannot be drawn.
+    fn acquire(&mut self) -> Result<(wgpu::SurfaceTexture, bool), FrameOutcome> {
+        let mut acquired = self.surface.get_current_texture();
+        if matches!(acquired, wgpu::CurrentSurfaceTexture::Outdated) {
+            self.surface.configure(&self.device, &self.config);
+            acquired = self.surface.get_current_texture();
+        }
+        match acquired {
+            wgpu::CurrentSurfaceTexture::Success(texture) => Ok((texture, false)),
+            wgpu::CurrentSurfaceTexture::Suboptimal(texture) => Ok((texture, true)),
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                if self.skips == 0 {
+                    self.last_skip_log = Instant::now();
+                }
+                self.skips += 1;
+                Err(FrameOutcome::Skipped)
+            }
+            wgpu::CurrentSurfaceTexture::Validation => Err(self.validation_error()),
+            wgpu::CurrentSurfaceTexture::Lost => {
+                log::error!("Surface lost");
+                Err(FrameOutcome::Broken)
+            }
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                log::error!("Surface still outdated after a reconfigure");
+                Err(FrameOutcome::Broken)
+            }
+        }
+    }
 
-        // 4. Prepare text renderer
+    fn validation_error(&mut self) -> FrameOutcome {
+        self.validation_errors += 1;
+        if self.validation_errors >= MAX_VALIDATION_ERRORS {
+            log::error!(
+                "Surface texture validation failed {} times in a row",
+                self.validation_errors
+            );
+            return FrameOutcome::Broken;
+        }
+        if warning_due(&mut self.last_validation_warn) {
+            log::warn!(
+                "Surface texture validation error ({} in a row), skipping frame",
+                self.validation_errors
+            );
+        }
+        FrameOutcome::Skipped
+    }
+
+    /// Upload the viewport and the layers' glyphs. False when the text cannot be drawn
+    /// this frame.
+    fn upload_text(&mut self) -> bool {
         self.viewport.update(
             &self.queue,
             Resolution {
-                width: w,
-                height: h,
+                width: self.config.width,
+                height: self.config.height,
             },
         );
-
-        if let Err(e) = self.text_renderer.prepare(
+        let text_areas: Vec<_> = self.layers.iter().flat_map(|l| l.text_areas()).collect();
+        match self.text_renderer.prepare(
             &self.device,
             &self.queue,
             &mut self.font_system,
@@ -289,64 +411,37 @@ impl Compositor {
             text_areas,
             &mut self.swash_cache,
         ) {
-            log::warn!("Text prepare failed, skipping frame: {e}");
-            return false;
+            Ok(()) => true,
+            Err(e) => {
+                if warning_due(&mut self.last_prepare_warn) {
+                    log::warn!("Text prepare failed, presenting a black frame: {e}");
+                }
+                false
+            }
         }
+    }
 
-        // 5. Get surface texture
-        let t0 = Instant::now();
-        let output = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(t) => t,
-            wgpu::CurrentSurfaceTexture::Outdated
-            | wgpu::CurrentSurfaceTexture::Suboptimal(_)
-            | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.device, &self.config);
-                match self.surface.get_current_texture() {
-                    wgpu::CurrentSurfaceTexture::Success(t) => t,
-                    other => {
-                        log::warn!("Failed to get surface texture after reconfigure: {other:?}");
-                        return false;
-                    }
-                }
-            }
-            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
-                if self.skips == 0 {
-                    self.last_skip_log = Instant::now();
-                }
-                self.skips += 1;
-                return false;
-            }
-            wgpu::CurrentSurfaceTexture::Validation => {
-                log::warn!("Surface texture validation error, skipping frame");
-                return false;
-            }
-        };
-        let texture_ms = t0.elapsed().as_millis();
-
-        // 6. Render pass
-        let view = output.texture.create_view(&Default::default());
+    /// A black clear, with the layers drawn over it when `draw_layers` is set.
+    fn encode_frame(&self, target: &wgpu::Texture, draw_layers: bool) -> wgpu::CommandBuffer {
+        let view = target.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
-        {
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("render"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
-                        store: wgpu::StoreOp::Store,
-                    },
-                    depth_slice: None,
-                })],
-                ..Default::default()
-            });
-
-            // 7. Custom GPU commands from layers
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("render"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                    store: wgpu::StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            ..Default::default()
+        });
+        if draw_layers {
             for layer in &self.layers {
                 layer.render_custom(&mut pass);
             }
-
-            // 8. Text on top (degrade to a black frame rather than abort on error)
             if let Err(e) = self
                 .text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)
@@ -354,22 +449,7 @@ impl Compositor {
                 log::warn!("Text render failed, presenting without it: {e}");
             }
         }
-
-        let t1 = Instant::now();
-        self.queue.submit(Some(encoder.finish()));
-        let submit_ms = t1.elapsed().as_millis();
-
-        let t2 = Instant::now();
-        output.present();
-        let present_ms = t2.elapsed().as_millis();
-
-        if texture_ms > 50 || submit_ms > 50 || present_ms > 50 {
-            log::warn!(
-                "Render: texture={texture_ms}ms submit={submit_ms}ms present={present_ms}ms"
-            );
-        }
-
-        self.text_atlas.trim();
-        true
+        drop(pass);
+        encoder.finish()
     }
 }

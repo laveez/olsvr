@@ -19,9 +19,9 @@ pub enum BackendEvent {
     #[allow(dead_code)]
     Resume,
     DismissInput,
-    /// The backend could not create any saver surface for a `Show` (e.g. zero
-    /// attached displays). Emitted only by the macOS backend.
-    #[allow(dead_code)]
+    /// The saver surface cannot render. Both backends send it when a frame reports the
+    /// surface or device broken, and macOS also when no saver surface could be created
+    /// for a `Show` (e.g. zero attached displays).
     ShowFailed,
     /// The compositor or the user closed the saver surface. Emitted only by the
     /// Wayland backend.

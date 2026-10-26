@@ -5,8 +5,26 @@ updates:
     schedule:
       interval: weekly
     groups:
-      dev-dependencies:
-        dependency-type: development
+      wgpu-stack:
+        patterns: ["wgpu*", "glyphon", "cosmic-text"]
+      wayland:
+        patterns: ["smithay-client-toolkit", "wayland-*", "calloop*"]
+      macos:
+        patterns: ["objc2*", "core-foundation"]
+      minor-patch:
+        update-types: ["minor", "patch"]
+      security:
+        applies-to: security-updates
+        patterns: ["*"]
+    # winit 0.30 pins objc2 0.5, so these move together with the winit 0.31 migration.
+    # Ranges, not semver-major: Dependabot reads 0.30 -> 0.31 as a minor update.
+    ignore:
+      - dependency-name: "winit"
+        versions: [">= 0.31"]
+      - dependency-name: "objc2"
+        versions: [">= 0.6"]
+      - dependency-name: "objc2-app-kit"
+        versions: [">= 0.3"]
     commit-message:
       prefix: "Chore"
 
@@ -14,5 +32,8 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
     commit-message:
       prefix: "Chore"

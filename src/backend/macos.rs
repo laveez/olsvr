@@ -10,8 +10,8 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use core_foundation::base::{CFGetTypeID, CFRange, TCFType};
-use core_foundation::boolean::CFBoolean;
-use core_foundation::number::CFNumber;
+use core_foundation::boolean::{CFBoolean, CFBooleanRef};
+use core_foundation::number::{CFNumber, CFNumberRef};
 use core_foundation::string::{CFString, CFStringGetCharacters, CFStringGetLength, CFStringRef};
 use objc2_app_kit::{
     NSColor, NSCursor, NSScreen, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
@@ -60,7 +60,6 @@ unsafe extern "C" {
 #[link(name = "CoreFoundation", kind = "framework")]
 unsafe extern "C" {
     fn CFRelease(cf: *const c_void);
-    fn CFEqual(a: *const c_void, b: *const c_void) -> u8;
     fn CFDictionaryGetCount(dict: *const c_void) -> isize;
     fn CFDictionaryGetKeysAndValues(
         dict: *const c_void,
@@ -246,12 +245,33 @@ fn display_sleep_inhibited() -> Option<(i32, String)> {
     inhibitor
 }
 
+/// The flag under `key` in `dict`: a CFBoolean's value, or whether a CFNumber holding an
+/// integer is non-zero. `None` for a missing key or any other value. `dict` must be a valid
+/// CFDictionary.
+unsafe fn flag_value(dict: *const c_void, key: &str) -> Option<bool> {
+    let key = CFString::new(key);
+    // SAFETY: `dict` is valid by contract. The value is borrowed (get rule), so the wrapper
+    // retains it and its drop balances that; its type is checked before it is wrapped.
+    unsafe {
+        let value = CFDictionaryGetValue(dict, key.as_concrete_TypeRef() as *const c_void);
+        if value.is_null() {
+            return None;
+        }
+        let type_id = CFGetTypeID(value);
+        if type_id == CFBoolean::type_id() {
+            Some(CFBoolean::wrap_under_get_rule(value as CFBooleanRef).into())
+        } else if type_id == CFNumber::type_id() {
+            CFNumber::wrap_under_get_rule(value as CFNumberRef)
+                .to_i64()
+                .map(|number| number != 0)
+        } else {
+            None
+        }
+    }
+}
+
 /// True while the login session is locked, or switched out by fast user switching.
 fn session_locked() -> bool {
-    // `CGSSessionScreenIsLocked` is undocumented and usually absent while unlocked.
-    // CGSession.h defines kCGSessionOnConsoleKey as "kCGSSessionOnConsoleKey".
-    let screen_locked = CFString::new("CGSSessionScreenIsLocked");
-    let on_console = CFString::new("kCGSSessionOnConsoleKey");
     // SAFETY: CoreGraphics hands us a dictionary we own (create rule), released below;
     // its values are borrowed (get rule) until then.
     unsafe {
@@ -259,15 +279,11 @@ fn session_locked() -> bool {
         if session.is_null() {
             return false;
         }
-        let holds = |key: &CFString, value: bool| {
-            let found = CFDictionaryGetValue(session, key.as_concrete_TypeRef() as *const c_void);
-            !found.is_null()
-                && CFEqual(
-                    found,
-                    CFBoolean::from(value).as_concrete_TypeRef() as *const c_void,
-                ) != 0
-        };
-        let locked = holds(&screen_locked, true) || holds(&on_console, false);
+        // `CGSSessionScreenIsLocked` is undocumented: usually absent while unlocked, and its
+        // CF type is not guaranteed. CGSession.h defines kCGSessionOnConsoleKey as
+        // "kCGSSessionOnConsoleKey".
+        let locked = flag_value(session, "CGSSessionScreenIsLocked") == Some(true)
+            || flag_value(session, "kCGSSessionOnConsoleKey") == Some(false);
         CFRelease(session);
         locked
     }

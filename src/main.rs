@@ -37,7 +37,7 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub timeout: Option<u32>,
 
-    /// Send SIGUSR1 to a running instance to activate it
+    /// Send SIGUSR1 to a running instance to activate it (Linux only)
     #[arg(long)]
     pub activate: bool,
 

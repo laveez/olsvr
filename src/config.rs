@@ -12,7 +12,8 @@ pub enum DisplayScope {
     /// Only the primary display (preserves the original single-window behavior).
     #[default]
     Primary,
-    /// Every connected display.
+    /// Every connected display on macOS. Wayland renders one surface on the output the
+    /// compositor chooses.
     All,
 }
 
@@ -21,13 +22,13 @@ pub enum DisplayScope {
 #[serde(rename_all = "kebab-case")]
 pub enum KeepAwake {
     /// Only while the screensaver is showing. On GNOME this also stops the auto-lock and the
-    /// screen blank while the saver is visible.
+    /// screen blank while the saver is visible; on macOS, a lock that follows display sleep.
     #[default]
     WhileActive,
     /// For the whole session, released while it is locked (macOS and GNOME). On GNOME this also
-    /// stops the auto-lock.
+    /// stops the auto-lock; on macOS, a lock that follows display sleep.
     Always,
-    /// Never inhibit display sleep. On GNOME the idle lock then runs over the saver.
+    /// Never inhibit display sleep. The desktop's own idle lock then runs over the saver.
     Off,
 }
 

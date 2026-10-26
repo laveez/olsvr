@@ -193,9 +193,10 @@ fn lossy_string(string: &CFString) -> String {
 
 /// The owning PID and `AssertName` (empty if it has none) of the first display-sleep
 /// assertion another app holds, e.g. a video player or presentation keeping the screen on.
-/// The macOS analog of the Wayland `IsInhibited` check, so the saver doesn't cover playing
-/// video. Our own keep-awake assertion (held under some `keep_awake` policies) is ignored
-/// by owning PID and by name, so a second olsvr instance doesn't count either.
+/// The macOS analog of the Wayland inhibitor gate (`idle_inhibited_by_others`), so the
+/// saver doesn't cover playing video. Our own keep-awake assertion (held under some
+/// `keep_awake` policies) is ignored by owning PID and by name, so a second olsvr instance
+/// doesn't count either.
 fn display_sleep_inhibited() -> Option<(i32, String)> {
     let own_pid = std::process::id() as i32;
 

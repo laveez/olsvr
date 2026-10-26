@@ -1,0 +1,11 @@
+[advisories]
+yanked = "deny"
+ignore = [
+    # Unmaintained, not a vulnerability. fontdb (cosmic-text via glyphon) and ab_glyph
+    # (winit via sctk-adwaita) still parse fonts with it; drop this once they move off it.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser is unmaintained and has no successor release; only reachable through fontdb and ab_glyph" },
+]
+
+[bans]
+# Duplicates come from the wgpu, winit and wayland stacks, which nothing here can align.
+multiple-versions = "allow"

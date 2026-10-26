@@ -23,9 +23,9 @@ pub enum BackendEvent {
     /// surface or device broken, and macOS also when no saver surface could be created
     /// for a `Show` (e.g. zero attached displays).
     ShowFailed,
-    /// The compositor or the user closed the saver surface. Emitted only by the
-    /// Wayland backend.
-    #[allow(dead_code)]
+    /// The saver surface is gone or covered. Wayland sends it when the compositor or the
+    /// user closes the window, or when the GNOME session locks; macOS sends it when the
+    /// session locks.
     SurfaceClosed,
     ActivateSignal,
     /// Reserved graceful-shutdown event; no backend emits it yet.

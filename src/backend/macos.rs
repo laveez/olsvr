@@ -456,13 +456,18 @@ impl MacApp {
         }
     }
 
-    fn set_locked(&mut self, locked: bool) {
+    fn set_locked(&mut self, locked: bool, event_loop: &ActiveEventLoop) {
         if locked == self.locked {
             return;
         }
         self.locked = locked;
         log::info!("Session {}", if locked { "locked" } else { "unlocked" });
         self.reconcile_keep_awake();
+        if locked && !self.targets.is_empty() {
+            // No grace, unlike DismissInput: the saver cannot draw over the lock screen,
+            // even when the lock comes right after activation.
+            self.on_event(BackendEvent::SurfaceClosed, event_loop);
+        }
     }
 
     fn on_event(&mut self, ev: BackendEvent, event_loop: &ActiveEventLoop) {
@@ -648,12 +653,16 @@ impl ApplicationHandler for MacApp {
         }
         self.started = true;
         // Ahead of init, so "always" takes no hold when starting behind a lock screen.
-        self.set_locked(session_locked());
+        self.set_locked(session_locked(), event_loop);
         // Startup commands (holds keep-awake under the "always" policy).
         let cmds = self.engine.init();
         self.apply(cmds, event_loop);
         if self.show_now {
-            self.on_event(BackendEvent::ActivateSignal, event_loop);
+            if self.locked {
+                log::info!("Session locked, not activating");
+            } else {
+                self.on_event(BackendEvent::ActivateSignal, event_loop);
+            }
         }
     }
 
@@ -661,7 +670,7 @@ impl ApplicationHandler for MacApp {
         let poll_due = self.last_poll.elapsed() >= POLL_INTERVAL;
         if poll_due {
             self.last_poll = Instant::now();
-            self.set_locked(session_locked());
+            self.set_locked(session_locked(), event_loop);
         }
 
         // Drive the Engine from the system-wide idle timer. This is the reliable

@@ -267,21 +267,25 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// isn't dismissed by the keystroke that launched it.
 const DISMISS_IDLE_SECS: f64 = 0.5;
 
-/// If the render loop goes this long without completing a frame while the saver
-/// is active, the watchdog force-exits to release the screen.
+/// If an armed watchdog sees no beat for this long, it force-exits to release the
+/// screen.
 const WATCHDOG_STALL: Duration = Duration::from_secs(5);
 
 /// Safety net against a trapped screen. The saver window sits at screen-saver
 /// level above everything, so if the render/event loop ever stalls (e.g. a GPU
 /// surface call blocking on a display glitch) the black window would be left with
-/// no way to dismiss it. This separate thread force-exits if the loop completes
-/// no frame for `WATCHDOG_STALL` while active.
+/// no way to dismiss it. This separate thread force-exits when no beat arrives for
+/// `WATCHDOG_STALL` while armed. Beats come from a completed frame (presented or
+/// skipped), from each `about_to_wait` pass while every saver window is occluded,
+/// and from `show()` after each display's renderer init.
 ///
 /// Exiting non-zero is deliberate: the launchd agent's KeepAlive only restarts on
 /// failure, so a clean exit would leave the saver silently dead until the user
-/// noticed. The relaunch is bounded — `ThrottleInterval` delays it and the new
-/// process starts dormant, needing a full idle timeout before it can activate
-/// again — so even a deterministic hang costs a brief flash, not a lockout.
+/// noticed. `ThrottleInterval` only spaces spawns, so a long-running agent is
+/// respawned at once. What keeps the new process from showing at once is the
+/// `hidden_at` seed in `run()`: the next show needs a full idle timeout from
+/// process start. The trade: a crash leaves the panel uncovered longer, but there
+/// is no flashing restart loop.
 struct Watchdog {
     start: Instant,
     last_beat_ms: AtomicU64,
@@ -297,7 +301,7 @@ impl Watchdog {
         })
     }
 
-    /// Record that the render loop just completed a pass.
+    /// Record that the main thread just made progress.
     fn beat(&self) {
         self.last_beat_ms
             .store(self.start.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -328,7 +332,8 @@ impl Watchdog {
                         "watchdog: render stalled {since_beat}ms while active — exiting to release the display (launchd will restart)"
                     );
                     let _ = std::fs::remove_file(crate::pid_path());
-                    std::process::exit(1);
+                    // exit() can hang in atexit and framework handlers with the main thread wedged.
+                    unsafe { libc::_exit(1) }
                 }
             }
         });
@@ -376,7 +381,9 @@ pub fn run(args: RunArgs) {
         debug: args.debug,
         cursor_hidden: false,
         watchdog,
-        hidden_at: None,
+        // As if just dismissed, so a restarted agent waits a full idle timeout before
+        // its first show; the Watchdog's relaunch bound depends on it.
+        hidden_at: Some(Instant::now()),
         show_failures: 0,
     };
     event_loop
@@ -540,7 +547,7 @@ impl MacApp {
             };
 
             let (layers, layer_configs) = self.config.build_layers(self.debug);
-            let Some(compositor) = Compositor::new(
+            let compositor = Compositor::new(
                 &instance,
                 surface,
                 size.width.max(1),
@@ -548,7 +555,10 @@ impl MacApp {
                 layers,
                 &layer_configs,
                 self.data_cache.clone(),
-            ) else {
+            );
+            // Pass or fail, a slow init on one display must not eat the next one's stall window.
+            self.watchdog.beat();
+            let Some(compositor) = compositor else {
                 log::error!("Failed to init renderer, skipping display");
                 continue;
             };
@@ -622,7 +632,8 @@ impl MacApp {
         self.hidden_at = Some(Instant::now());
     }
 
-    /// True once a full idle period has passed since the saver was last dismissed.
+    /// True once a full idle period has passed since the saver was last dismissed
+    /// (startup counts as a dismiss, see `run()`).
     ///
     /// `CGEventSourceSecondsSinceLastEventType` trails the input winit delivers by
     /// up to a second, so the reading taken right after a dismiss is still the
@@ -704,8 +715,8 @@ impl ApplicationHandler for MacApp {
                 t.window.request_redraw();
             }
         }
-        // While every window is occluded (lock screen, sleeping display) nothing
-        // renders, so beat here. A visible window still has to complete its frames.
+        // While every window is occluded (a sleeping display) nothing renders, so
+        // beat here. A visible window still has to complete its frames.
         if !self.targets.is_empty() && self.targets.iter().all(|t| t.occluded) {
             self.watchdog.beat();
         }

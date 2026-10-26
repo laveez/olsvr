@@ -432,26 +432,25 @@ struct MacApp {
 impl MacApp {
     /// Execute the commands the Engine produced.
     fn apply(&mut self, cmds: Vec<EngineCommand>, event_loop: &ActiveEventLoop) {
+        let mut show_failed = false;
         for cmd in cmds {
             match cmd {
-                EngineCommand::Show { .. } => {
-                    if !self.show(event_loop) {
-                        // Tell the Engine the show produced nothing, so it returns to
-                        // Dormant instead of latching Active with no windows (and no
-                        // input path that could ever dismiss it). The resulting Hide
-                        // sets `hidden_at`, pacing retries to one per idle cycle.
-                        let cmds = self.engine.handle(BackendEvent::ShowFailed, Instant::now());
-                        self.apply(cmds, event_loop);
-                    }
-                }
+                EngineCommand::Show { .. } => show_failed |= !self.show(event_loop),
                 EngineCommand::Hide => self.hide(),
-                EngineCommand::SetKeepAwake(on) => {
-                    self.wants_keep_awake = on;
-                    self.reconcile_keep_awake();
-                }
+                EngineCommand::SetKeepAwake(on) => self.wants_keep_awake = on,
                 EngineCommand::Quit => event_loop.exit(),
             }
         }
+        // Reported after the batch so the Engine's rollback (Hide, SetKeepAwake(false))
+        // has the last word on `wants_keep_awake`; mid-batch, the SetKeepAwake(true)
+        // after the Show would overrule it. Without the report the Engine latches Active
+        // with no windows (and no input path that could ever dismiss it). The resulting
+        // Hide sets `hidden_at`, pacing retries to one per idle cycle.
+        if show_failed {
+            self.on_event(BackendEvent::ShowFailed, event_loop);
+        }
+        // The hold follows the final `wants_keep_awake`, so a failed show never takes it.
+        self.reconcile_keep_awake();
     }
 
     /// Match the display-sleep assertion to what the Engine wants, but never hold it

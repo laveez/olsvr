@@ -488,8 +488,8 @@ struct MacApp {
     keep_awake_id: Option<u32>,
     wants_keep_awake: bool,
     locked: bool,
-    /// The last session-lock check and skipped-frame retry, both paced to
-    /// `POLL_INTERVAL` because `about_to_wait` also runs after every frame.
+    /// The last session-lock check and the retry of skipped frames and occluded windows, both
+    /// paced to `POLL_INTERVAL` because `about_to_wait` also runs after every frame.
     last_poll: Instant,
     timeout: Duration,
     weather_started: bool,
@@ -806,10 +806,12 @@ impl ApplicationHandler for MacApp {
         }
 
         if poll_due {
+            // Occluded windows too: a stale flag would freeze a full-brightness frame on an
+            // OLED until input, and an occluded retry is one CPU-only frame per second.
             for t in self
                 .targets
                 .iter_mut()
-                .filter(|t| t.needs_retry && !t.occluded)
+                .filter(|t| t.needs_retry || t.occluded)
             {
                 t.needs_retry = false;
                 t.window.request_redraw();
@@ -851,10 +853,11 @@ impl ApplicationHandler for MacApp {
                     }
                     FrameOutcome::Presented => {
                         t.needs_retry = false;
-                        // Continuous animation while visible; `Occluded(false)` restarts it.
-                        if !t.occluded {
-                            t.window.request_redraw();
-                        }
+                        // wgpu's Metal backend returns Occluded instead of a drawable while AppKit
+                        // reports the window occluded, so a present proves it visible, even when
+                        // the `Occluded(false)` that clears the flag never arrived.
+                        t.occluded = false;
+                        t.window.request_redraw();
                     }
                     // An occluded surface skips without blocking, so re-requesting here
                     // would spin; `about_to_wait` retries at the poll rate instead.

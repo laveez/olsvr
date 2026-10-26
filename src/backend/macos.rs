@@ -1,7 +1,8 @@
 //! macOS backend: a borderless screen-saver-level window per display rendered by the
 //! portable `Compositor`, driven by the shared `Engine`. Idle is detected by polling
 //! `CGEventSourceSecondsSinceLastEventType`; the display is kept awake with an
-//! `IOPMAssertion` (the OLED-stays-awake / HDMI-redetect fix).
+//! `IOPMAssertion` (the OLED-stays-awake / HDMI-redetect fix), except while the session
+//! is locked.
 
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -9,6 +10,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use core_foundation::base::TCFType;
+use core_foundation::boolean::CFBoolean;
 use core_foundation::string::{CFString, CFStringRef};
 use objc2_app_kit::{
     NSColor, NSCursor, NSScreen, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
@@ -36,6 +38,8 @@ unsafe extern "C" {
     fn CGDisplayHideCursor(display: u32) -> i32;
     fn CGDisplayShowCursor(display: u32) -> i32;
     fn CGMainDisplayID() -> u32;
+    /// A CFDictionary the caller releases, or null outside a GUI session.
+    fn CGSessionCopyCurrentDictionary() -> *const c_void;
 }
 
 #[link(name = "IOKit", kind = "framework")]
@@ -167,6 +171,33 @@ fn display_sleep_inhibited() -> bool {
         CFRelease(by_pid);
     }
     inhibited
+}
+
+/// True while the login session is locked, or switched out by fast user switching.
+fn session_locked() -> bool {
+    // `CGSSessionScreenIsLocked` is undocumented and usually absent while unlocked.
+    // CGSession.h defines kCGSessionOnConsoleKey as "kCGSSessionOnConsoleKey".
+    let screen_locked = CFString::new("CGSSessionScreenIsLocked");
+    let on_console = CFString::new("kCGSSessionOnConsoleKey");
+    // SAFETY: CoreGraphics hands us a dictionary we own (create rule), released below;
+    // its values are borrowed (get rule) until then.
+    unsafe {
+        let session = CGSessionCopyCurrentDictionary();
+        if session.is_null() {
+            return false;
+        }
+        let holds = |key: &CFString, value: bool| {
+            let found = CFDictionaryGetValue(session, key.as_concrete_TypeRef() as *const c_void);
+            !found.is_null()
+                && CFEqual(
+                    found,
+                    CFBoolean::from(value).as_concrete_TypeRef() as *const c_void,
+                ) != 0
+        };
+        let locked = holds(&screen_locked, true) || holds(&on_console, false);
+        CFRelease(session);
+        locked
+    }
 }
 
 /// Turn the freshly-created winit window into a full-display screen-saver overlay via
@@ -335,6 +366,9 @@ pub fn run(args: RunArgs) {
         data_cache: Arc::new(RwLock::new(DataCache::default())),
         targets: Vec::new(),
         keep_awake_id: None,
+        wants_keep_awake: false,
+        locked: false,
+        last_poll: Instant::now(),
         timeout,
         weather_started: false,
         started: false,
@@ -354,6 +388,9 @@ pub fn run(args: RunArgs) {
 struct DisplayTarget {
     window: Arc<Window>,
     compositor: Compositor,
+    occluded: bool,
+    /// The last frame was skipped; `about_to_wait` requests the retry.
+    needs_retry: bool,
 }
 
 struct MacApp {
@@ -362,6 +399,11 @@ struct MacApp {
     data_cache: Arc<RwLock<DataCache>>,
     targets: Vec<DisplayTarget>,
     keep_awake_id: Option<u32>,
+    wants_keep_awake: bool,
+    locked: bool,
+    /// The last session-lock check and skipped-frame retry, both paced to
+    /// `POLL_INTERVAL` because `about_to_wait` also runs after every frame.
+    last_poll: Instant,
     timeout: Duration,
     weather_started: bool,
     started: bool,
@@ -390,22 +432,37 @@ impl MacApp {
                     }
                 }
                 EngineCommand::Hide => self.hide(),
-                EngineCommand::SetKeepAwake(true) => {
-                    if self.keep_awake_id.is_none() {
-                        self.keep_awake_id = acquire_keep_awake();
-                        if self.keep_awake_id.is_none() {
-                            log::warn!("Failed to acquire display-sleep assertion");
-                        }
-                    }
-                }
-                EngineCommand::SetKeepAwake(false) => {
-                    if let Some(id) = self.keep_awake_id.take() {
-                        release_keep_awake(id);
-                    }
+                EngineCommand::SetKeepAwake(on) => {
+                    self.wants_keep_awake = on;
+                    self.reconcile_keep_awake();
                 }
                 EngineCommand::Quit => event_loop.exit(),
             }
         }
+    }
+
+    /// Match the display-sleep assertion to what the Engine wants, but never hold it
+    /// while the session is locked: the saver cannot draw over the lock screen, so the
+    /// hold would only keep the lock screen lit.
+    fn reconcile_keep_awake(&mut self) {
+        let hold = self.wants_keep_awake && !self.locked;
+        if hold && self.keep_awake_id.is_none() {
+            self.keep_awake_id = acquire_keep_awake();
+            if self.keep_awake_id.is_none() {
+                log::warn!("Failed to acquire display-sleep assertion");
+            }
+        } else if !hold && let Some(id) = self.keep_awake_id.take() {
+            release_keep_awake(id);
+        }
+    }
+
+    fn set_locked(&mut self, locked: bool) {
+        if locked == self.locked {
+            return;
+        }
+        self.locked = locked;
+        log::info!("Session {}", if locked { "locked" } else { "unlocked" });
+        self.reconcile_keep_awake();
     }
 
     fn on_event(&mut self, ev: BackendEvent, event_loop: &ActiveEventLoop) {
@@ -492,7 +549,12 @@ impl MacApp {
             };
 
             window.request_redraw();
-            self.targets.push(DisplayTarget { window, compositor });
+            self.targets.push(DisplayTarget {
+                window,
+                compositor,
+                occluded: false,
+                needs_retry: false,
+            });
         }
 
         if self.targets.is_empty() {
@@ -585,6 +647,8 @@ impl ApplicationHandler for MacApp {
             return;
         }
         self.started = true;
+        // Ahead of init, so "always" takes no hold when starting behind a lock screen.
+        self.set_locked(session_locked());
         // Startup commands (holds keep-awake under the "always" policy).
         let cmds = self.engine.init();
         self.apply(cmds, event_loop);
@@ -594,23 +658,47 @@ impl ApplicationHandler for MacApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let poll_due = self.last_poll.elapsed() >= POLL_INTERVAL;
+        if poll_due {
+            self.last_poll = Instant::now();
+            self.set_locked(session_locked());
+        }
+
         // Drive the Engine from the system-wide idle timer. This is the reliable
         // dismiss path: the saver windows are borderless and the app is an
         // accessory, so they don't always get key/mouse events themselves.
         let idle = idle_seconds();
         let showing = !self.targets.is_empty();
         if !showing
+            && !self.locked
             && idle >= self.timeout.as_secs_f64()
             && self.idle_cycle_elapsed()
             && !display_sleep_inhibited()
         {
-            // Skip activation while another app holds a display-sleep assertion
-            // (video playback, presentations) so the saver doesn't cover it.
+            // Skip activation while the lock screen would cover the saver, and while
+            // another app holds a display-sleep assertion (video playback,
+            // presentations) so the saver doesn't cover it.
             self.on_event(BackendEvent::Idle, event_loop);
         } else if showing && idle < DISMISS_IDLE_SECS {
             // Fresh input while showing — dismiss. DismissInput (1s grace), not
             // Resume (5s), so it's responsive even if you return right away.
             self.on_event(BackendEvent::DismissInput, event_loop);
+        }
+
+        if poll_due {
+            for t in self
+                .targets
+                .iter_mut()
+                .filter(|t| t.needs_retry && !t.occluded)
+            {
+                t.needs_retry = false;
+                t.window.request_redraw();
+            }
+        }
+        // While every window is occluded (lock screen, sleeping display) nothing
+        // renders, so beat here. A visible window still has to complete its frames.
+        if !self.targets.is_empty() && self.targets.iter().all(|t| t.occluded) {
+            self.watchdog.beat();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL_INTERVAL));
     }
@@ -623,16 +711,35 @@ impl ApplicationHandler for MacApp {
                     t.compositor.resize(size.width.max(1), size.height.max(1));
                 }
             }
+            WindowEvent::Occluded(occluded) => {
+                if let Some(t) = self.target_mut(id) {
+                    log::debug!("Saver window {id:?} occluded: {occluded}");
+                    t.occluded = occluded;
+                    if !occluded {
+                        t.window.request_redraw();
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
                 let Some(t) = self.target_mut(id) else {
                     return;
                 };
-                if t.compositor.render_frame(None) == FrameOutcome::Broken {
-                    self.on_event(BackendEvent::ShowFailed, event_loop);
-                    return;
+                match t.compositor.render_frame(None) {
+                    FrameOutcome::Broken => {
+                        self.on_event(BackendEvent::ShowFailed, event_loop);
+                        return;
+                    }
+                    FrameOutcome::Presented => {
+                        t.needs_retry = false;
+                        // Continuous animation while visible; `Occluded(false)` restarts it.
+                        if !t.occluded {
+                            t.window.request_redraw();
+                        }
+                    }
+                    // An occluded surface skips without blocking, so re-requesting here
+                    // would spin; `about_to_wait` retries at the poll rate instead.
+                    FrameOutcome::Skipped => t.needs_retry = true,
                 }
-                // Continuous animation: request the next frame for this window.
-                t.window.request_redraw();
                 // Any completed render is a heartbeat: the watchdog exists to catch
                 // a hung loop, and a skipped frame (occluded surface, sleeping
                 // display) means there is nothing to draw, not that a black window

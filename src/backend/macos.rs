@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
-use core_foundation::base::TCFType;
+use core_foundation::base::{CFGetTypeID, CFRange, TCFType};
 use core_foundation::boolean::CFBoolean;
-use core_foundation::string::{CFString, CFStringRef};
+use core_foundation::number::CFNumber;
+use core_foundation::string::{CFString, CFStringGetCharacters, CFStringGetLength, CFStringRef};
 use objc2_app_kit::{
     NSColor, NSCursor, NSScreen, NSView, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
@@ -72,6 +73,8 @@ unsafe extern "C" {
     fn CFNumberGetValue(number: *const c_void, number_type: isize, value: *mut c_void) -> u8;
 }
 
+const KCF_NUMBER_SINT32_TYPE: isize = 3;
+
 /// Seconds since the last HID input, system-wide.
 fn idle_seconds() -> f64 {
     // kCGEventSourceStateCombinedSessionState = 0, kCGAnyInputEventType = !0
@@ -94,10 +97,12 @@ fn show_cursor() {
     }
 }
 
+const KEEP_AWAKE_NAME: &str = "olsvr OLED screensaver";
+
 /// Acquire a "prevent the display from idle-sleeping" assertion.
 fn acquire_keep_awake() -> Option<u32> {
     let assertion_type = CFString::new("PreventUserIdleDisplaySleep");
-    let name = CFString::new("olsvr OLED screensaver");
+    let name = CFString::new(KEEP_AWAKE_NAME);
     let mut id: u32 = 0;
     let ok = unsafe {
         IOPMAssertionCreateWithName(
@@ -116,24 +121,92 @@ fn release_keep_awake(id: u32) {
     }
 }
 
-/// True if a process *other than us* currently holds a `PreventUserIdleDisplaySleep`
-/// assertion — e.g. a video player or presentation keeping the screen on. The macOS
-/// analog of the Wayland `IsInhibited` check, so the saver doesn't cover playing
-/// video. Our own keep-awake assertion (held under some `keep_awake` policies) is
-/// ignored by comparing the owning PID against ours.
-fn display_sleep_inhibited() -> bool {
-    const KCF_NUMBER_SINT32_TYPE: isize = 3;
+/// The CFString under `key` in `dict`, or `None` if the key is missing or holds another
+/// type. `dict` must be a valid CFDictionary.
+unsafe fn string_value(dict: *const c_void, key: &str) -> Option<CFString> {
+    let key = CFString::new(key);
+    // SAFETY: `dict` is valid by contract. The value is borrowed (get rule), so the
+    // wrapper retains it and its drop balances that.
+    unsafe {
+        let value = CFDictionaryGetValue(dict, key.as_concrete_TypeRef() as *const c_void);
+        if value.is_null() || CFGetTypeID(value) != CFString::type_id() {
+            return None;
+        }
+        Some(CFString::wrap_under_get_rule(value as CFStringRef))
+    }
+}
+
+/// True if `assertion`, one of the dictionaries `IOPMCopyAssertionsByProcess` lists, keeps
+/// the display awake. Chrome, Firefox and Electron create the deprecated
+/// `NoDisplaySleepAssertion`; `AssertType` keeps that spelling, while the private
+/// `AssertionTrueType` holds the canonical type when powerd adds it. `assertion` must be a
+/// valid CFDictionary.
+unsafe fn is_display_sleep_assertion(assertion: *const c_void) -> bool {
+    // SAFETY: `assertion` is valid by contract; every value read from it is type-checked
+    // before use.
+    unsafe {
+        let Some(assertion_type) = string_value(assertion, "AssertionTrueType")
+            .or_else(|| string_value(assertion, "AssertType"))
+        else {
+            return false;
+        };
+        if assertion_type != "PreventUserIdleDisplaySleep"
+            && assertion_type != "NoDisplaySleepAssertion"
+        {
+            return false;
+        }
+
+        let level_key = CFString::new("AssertLevel");
+        let level_ref =
+            CFDictionaryGetValue(assertion, level_key.as_concrete_TypeRef() as *const c_void);
+        if level_ref.is_null() || CFGetTypeID(level_ref) != CFNumber::type_id() {
+            return true;
+        }
+        let mut level: i32 = 0;
+        let read = CFNumberGetValue(
+            level_ref,
+            KCF_NUMBER_SINT32_TYPE,
+            &mut level as *mut i32 as *mut c_void,
+        );
+        read != 0 && level == 255 // kIOPMAssertionLevelOn
+    }
+}
+
+/// `string` as UTF-8, with unpaired surrogates replaced by U+FFFD. `CFString`'s own
+/// `Display` panics on a string that does not convert to UTF-8, and the names we log
+/// come from other processes.
+fn lossy_string(string: &CFString) -> String {
+    let string_ref = string.as_concrete_TypeRef();
+    // SAFETY: `string_ref` is a live CFString, and `units` has room for the `length`
+    // UTF-16 units CFStringGetCharacters writes for the full range.
+    let units = unsafe {
+        let length = CFStringGetLength(string_ref).max(0);
+        let mut units = vec![0; length as usize];
+        let range = CFRange {
+            location: 0,
+            length,
+        };
+        CFStringGetCharacters(string_ref, range, units.as_mut_ptr());
+        units
+    };
+    String::from_utf16_lossy(&units)
+}
+
+/// The owning PID and `AssertName` (empty if it has none) of the first display-sleep
+/// assertion another app holds, e.g. a video player or presentation keeping the screen on.
+/// The macOS analog of the Wayland `IsInhibited` check, so the saver doesn't cover playing
+/// video. Our own keep-awake assertion (held under some `keep_awake` policies) is ignored
+/// by owning PID and by name, so a second olsvr instance doesn't count either.
+fn display_sleep_inhibited() -> Option<(i32, String)> {
     let own_pid = std::process::id() as i32;
 
     let mut by_pid: *const c_void = std::ptr::null();
     // SAFETY: IOKit fills in a CFDictionary we own (create rule); freed below.
     if unsafe { IOPMCopyAssertionsByProcess(&mut by_pid) } != 0 || by_pid.is_null() {
-        return false; // can't determine — don't suppress activation
+        return None; // can't determine, so don't suppress activation
     }
 
-    let display_type = CFString::new("PreventUserIdleDisplaySleep");
-    let type_key = CFString::new("AssertType");
-    let mut inhibited = false;
+    let mut inhibitor = None;
 
     // SAFETY: walk the documented `{pid: [{AssertType: ...}, ...]}` structure, then
     // release the dictionary. Inner keys/values are borrowed (get rule).
@@ -156,21 +229,21 @@ fn display_sleep_inhibited() -> bool {
             let list = lists[i];
             for j in 0..CFArrayGetCount(list) {
                 let assertion = CFArrayGetValueAtIndex(list, j);
-                let ty = CFDictionaryGetValue(
-                    assertion,
-                    type_key.as_concrete_TypeRef() as *const c_void,
-                );
-                if !ty.is_null()
-                    && CFEqual(ty, display_type.as_concrete_TypeRef() as *const c_void) != 0
-                {
-                    inhibited = true;
-                    break 'scan;
+                if !is_display_sleep_assertion(assertion) {
+                    continue;
                 }
+                let name = string_value(assertion, "AssertName");
+                if name.as_ref().is_some_and(|name| *name == KEEP_AWAKE_NAME) {
+                    continue;
+                }
+                let name = name.map(|name| lossy_string(&name)).unwrap_or_default();
+                inhibitor = Some((pid, name));
+                break 'scan;
             }
         }
         CFRelease(by_pid);
     }
-    inhibited
+    inhibitor
 }
 
 /// True while the login session is locked, or switched out by fast user switching.
@@ -391,6 +464,7 @@ pub fn run(args: RunArgs) {
         // its first show; the Watchdog's relaunch bound depends on it.
         hidden_at: Some(Instant::now()),
         show_failures: 0,
+        display_inhibitor: None,
     };
     event_loop
         .run_app(&mut app)
@@ -427,6 +501,9 @@ struct MacApp {
     hidden_at: Option<Instant>,
     /// Consecutive failed show attempts, for log throttling.
     show_failures: u32,
+    /// The other app found holding a display-sleep assertion at the last idle check, so
+    /// the log shows when a hold starts and ends rather than every poll.
+    display_inhibitor: Option<(i32, String)>,
 }
 
 impl MacApp {
@@ -648,6 +725,24 @@ impl MacApp {
     fn idle_cycle_elapsed(&self) -> bool {
         self.hidden_at.is_none_or(|t| t.elapsed() >= self.timeout)
     }
+
+    /// Whether another app's display-sleep assertion should keep the saver away. Logs
+    /// when a hold starts and ends. Only the idle check calls it, so an end is logged
+    /// at the first idle check after the hold is gone, not when it is released.
+    fn display_inhibited(&mut self) -> bool {
+        let inhibitor = display_sleep_inhibited();
+        match (&self.display_inhibitor, &inhibitor) {
+            (None, Some((pid, name))) => log::info!(
+                "Not activating while pid {pid} holds a display-sleep assertion named {name:?}"
+            ),
+            (Some((pid, name)), None) => log::info!(
+                "Display-sleep assertion of pid {pid} named {name:?} released, activation resumes"
+            ),
+            _ => {}
+        }
+        self.display_inhibitor = inhibitor;
+        self.display_inhibitor.is_some()
+    }
 }
 
 impl Drop for MacApp {
@@ -698,7 +793,7 @@ impl ApplicationHandler for MacApp {
             && !self.locked
             && idle >= self.timeout.as_secs_f64()
             && self.idle_cycle_elapsed()
-            && !display_sleep_inhibited()
+            && !self.display_inhibited()
         {
             // Skip activation while the lock screen would cover the saver, and while
             // another app holds a display-sleep assertion (video playback,

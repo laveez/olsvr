@@ -214,7 +214,7 @@ fn track_lock_screen(conn: &dbus::blocking::Connection, locked: &Arc<AtomicBool>
         screensaver.method_call("org.gnome.ScreenSaver", "GetActive", ());
     match active {
         Ok((active,)) => locked.store(active, Ordering::Relaxed),
-        Err(e) => log::debug!("D-Bus: GetActive failed, assuming unlocked: {e}"),
+        Err(e) => log::warn!("D-Bus: GetActive failed, assuming unlocked: {e}"),
     }
 }
 

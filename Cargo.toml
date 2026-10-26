@@ -2,6 +2,7 @@
 name = "olsvr"
 version = "0.2.1"
 edition = "2024"
+rust-version = "1.89"
 description = "OLED screensaver for Wayland and macOS"
 license = "MIT"
 repository = "https://github.com/laveez/olsvr"

@@ -21,7 +21,7 @@ use winit::dpi::PhysicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::monitor::MonitorHandle;
-use winit::platform::macos::MonitorHandleExtMacOS;
+use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS, MonitorHandleExtMacOS};
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::RunArgs;
@@ -279,13 +279,12 @@ const WATCHDOG_STALL: Duration = Duration::from_secs(5);
 /// skipped), from each `about_to_wait` pass while every saver window is occluded,
 /// and from `show()` after each display's renderer init.
 ///
-/// Exiting non-zero is deliberate: the launchd agent's KeepAlive only restarts on
-/// failure, so a clean exit would leave the saver silently dead until the user
-/// noticed. `ThrottleInterval` only spaces spawns, so a long-running agent is
-/// respawned at once. What keeps the new process from showing at once is the
-/// `hidden_at` seed in `run()`: the next show needs a full idle timeout from
-/// process start. The trade: a crash leaves the panel uncovered longer, but there
-/// is no flashing restart loop.
+/// It exits with status 1, so launchd records a failed exit for the job; KeepAlive
+/// respawns the agent after any exit, clean or not. `ThrottleInterval` only spaces
+/// spawns, so a long-running agent is respawned at once. What keeps the new process
+/// from showing at once is the `hidden_at` seed in `run()`: the next show needs a
+/// full idle timeout from process start. The trade: a crash leaves the panel
+/// uncovered longer, but watchdog restarts are spaced a full idle timeout apart.
 struct Watchdog {
     start: Instant,
     last_beat_ms: AtomicU64,
@@ -362,7 +361,14 @@ pub fn run(args: RunArgs) {
     let watchdog = Watchdog::new();
     watchdog.spawn();
 
-    let event_loop = EventLoop::new().expect("failed to create winit event loop");
+    // winit's default menu binds Cmd+Q to terminate:, which ends the agent with exit 0.
+    // Accessory also covers a bare-binary run, where winit would pick Regular.
+    let mut builder = EventLoop::builder();
+    builder
+        .with_default_menu(false)
+        .with_activate_ignoring_other_apps(false)
+        .with_activation_policy(ActivationPolicy::Accessory);
+    let event_loop = builder.build().expect("failed to create winit event loop");
     event_loop.set_control_flow(ControlFlow::Wait);
 
     let mut app = MacApp {
@@ -725,7 +731,7 @@ impl ApplicationHandler for MacApp {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::CloseRequested => self.on_event(BackendEvent::SurfaceClosed, event_loop),
             WindowEvent::Resized(size) => {
                 if let Some(t) = self.target_mut(id) {
                     t.compositor.resize(size.width.max(1), size.height.max(1));
@@ -775,5 +781,9 @@ impl ApplicationHandler for MacApp {
             }
             _ => {}
         }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        log::warn!("Event loop exiting");
     }
 }

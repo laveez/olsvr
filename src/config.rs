@@ -20,12 +20,14 @@ pub enum DisplayScope {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
 pub enum KeepAwake {
-    /// Only while the screensaver is showing (mirrors the Wayland idle inhibitor).
+    /// Only while the screensaver is showing. On GNOME this also stops the auto-lock and the
+    /// screen blank while the saver is visible.
     #[default]
     WhileActive,
-    /// For the whole time the daemon runs (the OLED never sleeps).
+    /// For the whole session, released while it is locked (macOS and GNOME). On GNOME this also
+    /// stops the auto-lock.
     Always,
-    /// Never inhibit display sleep.
+    /// Never inhibit display sleep. On GNOME the idle lock then runs over the saver.
     Off,
 }
 

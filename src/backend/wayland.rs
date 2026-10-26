@@ -3,9 +3,11 @@
 //! `main`) live in the crate root (`src/main.rs`). Compiled only on Linux.
 
 use std::num::NonZeroU32;
-use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, RwLock, mpsc};
+use std::time::{Duration, Instant};
 
+use dbus::message::MatchRule;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState},
     delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
@@ -45,7 +47,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
 use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
 
 use crate::compositor::{Compositor, DebugInfo};
-use crate::config::Config;
+use crate::config::{Config, KeepAwake};
 use crate::data::{self, DataCache};
 use crate::engine::{BackendEvent, Engine, EngineCommand};
 use crate::{RunArgs, merge_cli, pid_path};
@@ -53,6 +55,97 @@ use crate::{RunArgs, merge_cli, pid_path};
 enum DbusIdleEvent {
     Idle,
     Resumed,
+    Locked,
+    Unlocked,
+}
+
+enum GnomeCommand {
+    SetKeepAwake(bool),
+}
+
+/// gnome-session's `GSM_INHIBITOR_FLAG_IDLE`.
+const IDLE_INHIBIT_FLAG: u32 = 8;
+/// The app id olsvr's own `always` inhibitor carries, which the idle gate skips.
+const INHIBIT_APP_ID: &str = "olsvr";
+
+/// The main thread's handle on the GNOME D-Bus monitor thread, which owns the session bus
+/// connection.
+struct GnomeSession {
+    tx: mpsc::Sender<GnomeCommand>,
+    locked: Arc<AtomicBool>,
+}
+
+impl GnomeSession {
+    fn spawn(events: Sender<DbusIdleEvent>, timeout_ms: u64) -> Self {
+        let (tx, commands) = mpsc::channel();
+        let locked = Arc::new(AtomicBool::new(false));
+        let thread_locked = Arc::clone(&locked);
+        std::thread::spawn(move || {
+            dbus_idle_monitor_loop(events, commands, thread_locked, timeout_ms)
+        });
+        Self { tx, locked }
+    }
+
+    fn set_keep_awake(&self, on: bool) {
+        if self.tx.send(GnomeCommand::SetKeepAwake(on)).is_err() {
+            log::error!("D-Bus monitor has stopped, so keep_awake cannot be applied");
+        }
+    }
+
+    fn locked(&self) -> bool {
+        self.locked.load(Ordering::Relaxed)
+    }
+}
+
+/// The `always` keep-awake hold: a gnome-session idle inhibitor. gnome-session also drops it
+/// when the monitor thread's connection closes, so a thread that exits cannot leave it behind.
+#[derive(Default)]
+struct KeepAwakeHold {
+    wanted: bool,
+    cookie: Option<u32>,
+    take_failed: bool,
+}
+
+impl KeepAwakeHold {
+    fn reconcile(
+        &mut self,
+        session: &dbus::blocking::Proxy<&dbus::blocking::Connection>,
+        locked: bool,
+    ) {
+        if !self.wanted || locked {
+            self.take_failed = false;
+            if let Some(cookie) = self.cookie.take() {
+                let released: Result<(), dbus::Error> =
+                    session.method_call("org.gnome.SessionManager", "Uninhibit", (cookie,));
+                match released {
+                    Ok(()) => log::info!("Keep-awake: released GNOME idle inhibitor {cookie}"),
+                    Err(e) => log::warn!("Keep-awake: Uninhibit of cookie {cookie} failed: {e}"),
+                }
+            }
+            return;
+        }
+        if self.cookie.is_some() || self.take_failed {
+            return;
+        }
+        let taken: Result<(u32,), dbus::Error> = session.method_call(
+            "org.gnome.SessionManager",
+            "Inhibit",
+            (INHIBIT_APP_ID, 0u32, "OLED screensaver", IDLE_INHIBIT_FLAG),
+        );
+        match taken {
+            Ok((cookie,)) => {
+                log::info!("Keep-awake: holding GNOME idle inhibitor {cookie}");
+                self.cookie = Some(cookie);
+            }
+            Err(e) => {
+                // A timed-out Inhibit can still create the inhibitor later, with no cookie to
+                // release it, so retry only once the hold has been dropped (a lock or a release)
+                // and is wanted again.
+                log::warn!("Keep-awake: SessionManager.Inhibit failed: {e}");
+                self.take_failed = true;
+            }
+        }
+    }
 }
 
 fn get_mutter_idletime(proxy: &dbus::blocking::Proxy<&dbus::blocking::Connection>) -> Option<u64> {
@@ -62,15 +155,75 @@ fn get_mutter_idletime(proxy: &dbus::blocking::Proxy<&dbus::blocking::Connection
         .map(|(ms,): (u64,)| ms)
 }
 
-fn is_idle_inhibited(proxy: &dbus::blocking::Proxy<&dbus::blocking::Connection>) -> bool {
-    proxy
-        .method_call("org.gnome.SessionManager", "IsInhibited", (8u32,))
-        .ok()
-        .map(|(inhibited,): (bool,)| inhibited)
-        .unwrap_or(false)
+/// Whether an app other than olsvr holds a gnome-session idle inhibitor. Inhibitors relayed by
+/// mutter count: mpv and SDL inhibit through that relay, and olsvr's own relayed inhibitor exists
+/// only while the saver shows, when activation is moot. No session manager on the bus counts as
+/// not inhibited.
+fn idle_inhibited_by_others(
+    session: &dbus::blocking::Proxy<&dbus::blocking::Connection>,
+) -> Result<bool, dbus::Error> {
+    const NO_SESSION_MANAGER: [&str; 2] = [
+        "org.freedesktop.DBus.Error.ServiceUnknown",
+        "org.freedesktop.DBus.Error.NameHasNoOwner",
+    ];
+    let conn = session.connection;
+    let find_other = || -> Result<bool, dbus::Error> {
+        let (paths,): (Vec<dbus::Path<'static>>,) =
+            session.method_call("org.gnome.SessionManager", "GetInhibitors", ())?;
+        for path in paths {
+            let inhibitor = conn.with_proxy("org.gnome.SessionManager", path, session.timeout);
+            let (flags,): (u32,) =
+                inhibitor.method_call("org.gnome.SessionManager.Inhibitor", "GetFlags", ())?;
+            if flags & IDLE_INHIBIT_FLAG == 0 {
+                continue;
+            }
+            let (app_id,): (String,) =
+                inhibitor.method_call("org.gnome.SessionManager.Inhibitor", "GetAppId", ())?;
+            if app_id != INHIBIT_APP_ID {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    };
+    match find_other() {
+        Err(e) if e.name().is_some_and(|n| NO_SESSION_MANAGER.contains(&n)) => Ok(false),
+        result => result,
+    }
 }
 
-fn dbus_idle_monitor_loop(tx: Sender<DbusIdleEvent>, timeout_ms: u64) {
+/// Keeps `locked` equal to GNOME's lock screen state. The match callback runs inside
+/// `Connection::process`.
+fn track_lock_screen(conn: &dbus::blocking::Connection, locked: &Arc<AtomicBool>) {
+    let flag = Arc::clone(locked);
+    let watch = conn.add_match(
+        MatchRule::new_signal("org.gnome.ScreenSaver", "ActiveChanged"),
+        move |(active,): (bool,), _: &dbus::blocking::Connection, _: &dbus::Message| {
+            flag.store(active, Ordering::Relaxed);
+            true
+        },
+    );
+    if let Err(e) = watch {
+        log::warn!("D-Bus: cannot watch the GNOME lock screen: {e}");
+    }
+    let screensaver = conn.with_proxy(
+        "org.gnome.ScreenSaver",
+        "/org/gnome/ScreenSaver",
+        Duration::from_secs(2),
+    );
+    let active: Result<(bool,), dbus::Error> =
+        screensaver.method_call("org.gnome.ScreenSaver", "GetActive", ());
+    match active {
+        Ok((active,)) => locked.store(active, Ordering::Relaxed),
+        Err(e) => log::debug!("D-Bus: GetActive failed, assuming unlocked: {e}"),
+    }
+}
+
+fn dbus_idle_monitor_loop(
+    tx: Sender<DbusIdleEvent>,
+    commands: mpsc::Receiver<GnomeCommand>,
+    locked: Arc<AtomicBool>,
+    timeout_ms: u64,
+) {
     let conn = match dbus::blocking::Connection::new_session() {
         Ok(c) => c,
         Err(e) => {
@@ -88,20 +241,60 @@ fn dbus_idle_monitor_loop(tx: Sender<DbusIdleEvent>, timeout_ms: u64) {
         "/org/gnome/SessionManager",
         std::time::Duration::from_secs(2),
     );
+    track_lock_screen(&conn, &locked);
 
     let mut was_idle = false;
+    let mut was_locked = false;
+    let mut hold = KeepAwakeHold::default();
+    let mut gate_warned_at: Option<Instant> = None;
     loop {
-        std::thread::sleep(std::time::Duration::from_secs(1));
+        // `process` handles at most one message per call and returns false once `wait` passes
+        // without one. It fails only when the bus is gone, which GetIdletime below reports too.
+        let mut wait = Duration::from_secs(1);
+        while let Ok(true) = conn.process(wait) {
+            wait = Duration::ZERO;
+        }
+
+        let is_locked = locked.load(Ordering::Relaxed);
+        if is_locked != was_locked {
+            was_locked = is_locked;
+            let event = if is_locked {
+                DbusIdleEvent::Locked
+            } else {
+                DbusIdleEvent::Unlocked
+            };
+            if tx.send(event).is_err() {
+                return;
+            }
+        }
+
+        while let Ok(GnomeCommand::SetKeepAwake(on)) = commands.try_recv() {
+            hold.wanted = on;
+        }
+        hold.reconcile(&session_proxy, is_locked);
 
         let Some(idle_ms) = get_mutter_idletime(&idle_proxy) else {
             log::error!("GetIdletime call failed — stopping D-Bus monitor");
             return;
         };
 
+        if is_locked {
+            continue;
+        }
         if !was_idle && idle_ms >= timeout_ms {
-            if is_idle_inhibited(&session_proxy) {
-                log::debug!("D-Bus: idle inhibited — skipping activation");
-                continue;
+            match idle_inhibited_by_others(&session_proxy) {
+                Ok(false) => {}
+                Ok(true) => {
+                    log::debug!("D-Bus: idle inhibited — skipping activation");
+                    continue;
+                }
+                Err(e) => {
+                    if gate_warned_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
+                        log::warn!("D-Bus: cannot read idle inhibitors, skipping activation: {e}");
+                        gate_warned_at = Some(Instant::now());
+                    }
+                    continue;
+                }
             }
             log::info!("D-Bus: user idle ({idle_ms}ms) — activating screensaver");
             if tx.send(DbusIdleEvent::Idle).is_err() {
@@ -123,7 +316,6 @@ struct Screensaver {
     window: Window,
     compositor: Option<Compositor>,
     inhibitor: Option<ZwpIdleInhibitorV1>,
-    dbus_inhibit_cookie: Option<u32>,
     activated_at: Instant,
 }
 
@@ -138,6 +330,7 @@ struct App {
     idle_notifier: Option<ExtIdleNotifierV1>,
     idle_notification: Option<ExtIdleNotificationV1>,
     idle_inhibit_manager: Option<ZwpIdleInhibitManagerV1>,
+    gnome: Option<GnomeSession>,
     seat: Option<wl_seat::WlSeat>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     pointer: Option<wl_pointer::WlPointer>,
@@ -149,6 +342,7 @@ struct App {
     running: bool,
     signal_activate: bool,
     signal_deactivate: bool,
+    signal_locked: bool,
     ready_to_draw: bool,
     last_draw: Option<Instant>,
     debug: bool,
@@ -174,33 +368,8 @@ impl App {
         let inhibitor = self
             .idle_inhibit_manager
             .as_ref()
+            .filter(|_| self.config.activation.keep_awake != KeepAwake::Off)
             .map(|mgr| mgr.create_inhibitor(window.wl_surface(), qh, ()));
-
-        // D-Bus ScreenSaver inhibit as belt-and-suspenders for GNOME DPMS
-        let dbus_inhibit_cookie = dbus::blocking::Connection::new_session()
-            .ok()
-            .and_then(|conn| {
-                let proxy = conn.with_proxy(
-                    "org.freedesktop.ScreenSaver",
-                    "/org/freedesktop/ScreenSaver",
-                    std::time::Duration::from_secs(2),
-                );
-                let result: Result<(u32,), _> = proxy.method_call(
-                    "org.freedesktop.ScreenSaver",
-                    "Inhibit",
-                    ("olsvr", "Screensaver active"),
-                );
-                match result {
-                    Ok((cookie,)) => {
-                        log::info!("D-Bus ScreenSaver inhibited (cookie={cookie})");
-                        Some(cookie)
-                    }
-                    Err(e) => {
-                        log::warn!("D-Bus ScreenSaver.Inhibit failed: {e}");
-                        None
-                    }
-                }
-            });
 
         // Start weather fetch thread if a weather layer is configured
         if let Some((location, interval_secs)) = self.config.weather_config() {
@@ -215,7 +384,6 @@ impl App {
             window,
             compositor: None,
             inhibitor,
-            dbus_inhibit_cookie,
             activated_at: Instant::now(),
         });
     }
@@ -226,11 +394,24 @@ impl App {
             match cmd {
                 EngineCommand::Show { .. } => self.activate(qh),
                 EngineCommand::Hide => self.deactivate(),
-                // On Wayland the idle inhibitor is tied to the screensaver
-                // surface, so keep-awake is handled inside activate/deactivate.
-                EngineCommand::SetKeepAwake(_) => {}
+                EngineCommand::SetKeepAwake(on) => self.set_keep_awake(on),
                 EngineCommand::Quit => self.running = false,
             }
+        }
+    }
+
+    /// Only `always` reaches GNOME. Under `while-active` the saver surface's zwp inhibitor is
+    /// the hold, and mutter relays it to gnome-session while the saver is visible.
+    fn set_keep_awake(&self, on: bool) {
+        if self.config.activation.keep_awake != KeepAwake::Always {
+            return;
+        }
+        match &self.gnome {
+            Some(gnome) => gnome.set_keep_awake(on),
+            None if on => log::error!(
+                "keep_awake = \"always\" is not supported on this desktop (Wayland: GNOME only)"
+            ),
+            None => {}
         }
     }
 
@@ -251,18 +432,6 @@ impl App {
             log::info!("Deactivating screensaver");
             if let Some(inhibitor) = ss.inhibitor {
                 inhibitor.destroy();
-            }
-            if let Some(cookie) = ss.dbus_inhibit_cookie
-                && let Ok(conn) = dbus::blocking::Connection::new_session()
-            {
-                let proxy = conn.with_proxy(
-                    "org.freedesktop.ScreenSaver",
-                    "/org/freedesktop/ScreenSaver",
-                    std::time::Duration::from_secs(2),
-                );
-                let _: Result<(), _> =
-                    proxy.method_call("org.freedesktop.ScreenSaver", "UnInhibit", (cookie,));
-                log::info!("D-Bus ScreenSaver uninhibited (cookie={cookie})");
             }
         }
     }
@@ -724,6 +893,7 @@ pub fn run(args: RunArgs) {
         idle_notifier,
         idle_notification: None,
         idle_inhibit_manager,
+        gnome: None,
         seat: None,
         keyboard: None,
         pointer: None,
@@ -735,6 +905,7 @@ pub fn run(args: RunArgs) {
         running: true,
         signal_activate: args.now,
         signal_deactivate: false,
+        signal_locked: false,
         ready_to_draw: false,
         last_draw: None,
         debug: args.debug,
@@ -784,7 +955,7 @@ pub fn run(args: RunArgs) {
             if get_mutter_idletime(&proxy).is_some() {
                 log::info!("Using D-Bus Mutter IdleMonitor fallback: {}ms", timeout_ms);
                 let (tx, rx) = channel::channel::<DbusIdleEvent>();
-                std::thread::spawn(move || dbus_idle_monitor_loop(tx, timeout_ms));
+                app.gnome = Some(GnomeSession::spawn(tx, timeout_ms));
                 event_loop
                     .handle()
                     .insert_source(rx, |event, _, app: &mut App| {
@@ -792,6 +963,11 @@ pub fn run(args: RunArgs) {
                             match msg {
                                 DbusIdleEvent::Idle => app.signal_activate = true,
                                 DbusIdleEvent::Resumed => app.signal_deactivate = true,
+                                DbusIdleEvent::Locked => {
+                                    log::info!("Session locked");
+                                    app.signal_locked = true;
+                                }
+                                DbusIdleEvent::Unlocked => log::info!("Session unlocked"),
                             }
                         }
                     })
@@ -804,7 +980,8 @@ pub fn run(args: RunArgs) {
         }
     }
 
-    // Apply any startup commands (e.g. hold keep-awake under the "always" policy).
+    // Apply any startup commands (e.g. hold keep-awake under the "always" policy). This comes
+    // after the D-Bus fallback above, which `always` needs on GNOME.
     let init_cmds = app.engine.init();
     app.apply(init_cmds, &qh);
 
@@ -817,12 +994,22 @@ pub fn run(args: RunArgs) {
 
         if app.signal_activate {
             app.signal_activate = false;
-            app.on_event(BackendEvent::ActivateSignal, &qh);
+            if app.gnome.as_ref().is_some_and(GnomeSession::locked) {
+                log::info!("Session locked, not activating");
+            } else {
+                app.on_event(BackendEvent::ActivateSignal, &qh);
+            }
         }
         if app.signal_deactivate {
             app.signal_deactivate = false;
             // The Engine owns the resume grace period now.
             app.on_event(BackendEvent::Resume, &qh);
+        }
+        if app.signal_locked {
+            app.signal_locked = false;
+            // No grace: the saver cannot draw over the lock screen, and its zwp inhibitor must
+            // go so that gsd-power can blank the locked panel.
+            app.on_event(BackendEvent::SurfaceClosed, &qh);
         }
 
         // Draw when the compositor signals readiness (frame callback), or

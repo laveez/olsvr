@@ -119,7 +119,7 @@ The `[activation]` table controls which displays the screensaver covers and how 
 | Field | Description | Default |
 |---|---|---|
 | `displays` | `primary` (primary display only) or `all` (every connected display). Multi-display is currently macOS; the Wayland backend renders a single fullscreen surface. | `primary` |
-| `keep_awake` | `while-active` (inhibit display sleep only while showing), `always` (keep the panel awake for the whole session), or `off` | `while-active` |
+| `keep_awake` | `while-active` (inhibit display sleep only while showing), `always` (keep the panel awake for the whole session, released while it is locked; macOS and GNOME), or `off`. **Security note:** on GNOME, `while-active` also stops the auto-lock and the screen blank while the saver is visible, so the session stays unlocked until you return, and `always` stops the auto-lock for the whole session. `off` lets GNOME's own idle lock run over the saver. | `while-active` |
 
 ### Example
 
@@ -144,6 +144,7 @@ update_interval = 600
 font_size = 28
 icon_font = "MesloLGS NF"
 
+# macOS (always: also GNOME)
 [activation]
 displays = "all"
 keep_awake = "always"

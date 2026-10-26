@@ -64,7 +64,7 @@ fn parse_fmi_xml(xml: &str) -> Result<(f32, u8, f32), String> {
     loop {
         match reader.read_event() {
             Ok(Event::Start(e)) | Ok(Event::Empty(e)) => {
-                let name = String::from_utf8_lossy(e.name().as_ref()).to_string();
+                let name = e.name().into_inner();
                 if name.ends_with("ParameterName") {
                     in_param_name = true;
                 } else if name.ends_with("ParameterValue") {
@@ -72,7 +72,7 @@ fn parse_fmi_xml(xml: &str) -> Result<(f32, u8, f32), String> {
                 }
             }
             Ok(Event::Text(e)) => {
-                let text = e.xml_content().unwrap_or_default().trim().to_string();
+                let text = e.xml10_content().trim().to_string();
                 if in_param_name {
                     current_param = text;
                     in_param_name = false;

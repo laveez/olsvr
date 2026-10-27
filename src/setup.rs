@@ -1,4 +1,5 @@
 use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -790,11 +791,20 @@ fn write_replacing(path: &str, contents: &str) -> std::io::Result<()> {
     // Named after this process, so that two setups at once never write into the same file
     staged.push(format!(".{}.new", std::process::id()));
     let _ = std::fs::remove_file(&staged);
+    // The old file's mode carries over, as with a write in place. A new file is never writable
+    // by group or others, whatever the umask: launchd refuses such a plist.
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
+        .mode(0o644)
         .open(&staged)
-        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .and_then(|mut file| {
+            file.write_all(contents.as_bytes())?;
+            match std::fs::metadata(&target) {
+                Ok(old) => file.set_permissions(old.permissions()),
+                Err(_) => Ok(()),
+            }
+        })
         .and_then(|()| std::fs::rename(&staged, &target));
     if written.is_err() {
         let _ = std::fs::remove_file(&staged);
@@ -806,8 +816,8 @@ fn write_replacing(path: &str, contents: &str) -> std::io::Result<()> {
 /// does not exist yet, or `path` itself. Fails on a symlink cycle, as a direct write would.
 fn link_target(path: &Path) -> std::io::Result<PathBuf> {
     let mut target = path.to_path_buf();
-    // Linux's own limit on symlinks followed in one lookup
-    for _ in 0..40 {
+    // Follows at most 40 links, Linux's own limit for one lookup
+    for _ in 0..=40 {
         let Ok(link) = std::fs::read_link(&target) else {
             return Ok(target);
         };

@@ -59,12 +59,18 @@ olsvr setup
 Run, preview and stop it:
 
 ```bash
-olsvr run              # Run in the foreground (plain `olsvr` does the same once a config exists)
-olsvr run --now        # Preview now; the first input ends it
-olsvr run --activate   # Make the running instance show now (Linux only)
-olsvr stop             # Stop the running instance (macOS: also the login agent)
-olsvr --version        # Print the version of the installed binary
+olsvr run
+olsvr run --now
+olsvr run --activate
+olsvr stop
+olsvr --version
 ```
+
+- `olsvr run` runs in the foreground (plain `olsvr` does the same once a config exists)
+- `olsvr run --now` previews now; the first input ends it
+- `olsvr run --activate` makes the running instance show now (Linux only)
+- `olsvr stop` stops the running instance (macOS: also the login agent)
+- `olsvr --version` prints the version of the installed binary
 
 > **`--now` beside a running instance:** on Linux it makes that instance show instead of previewing the binary you ran; on macOS it exits with status 4 until you `olsvr stop` the agent.
 >
@@ -84,7 +90,7 @@ cargo install --locked --path .
 
 ### Upgrading
 
-Install the new version the same way (add `--force` if cargo refuses because the `olsvr` binary already exists), then run `olsvr setup` again and answer Yes at the autostart step. The prompts start from your current settings, so Enter keeps them. Setup rewrites the systemd unit and restarts the service (Linux), or copies the new binary into the app bundle and reloads the login agent (macOS). Until then the old build keeps running, even though `olsvr --version` already prints the new version; [Troubleshooting](#troubleshooting) shows how to tell which build runs.
+Install the new version the same way (add `--force` if cargo refuses because the `olsvr` binary already exists), then run `olsvr setup` again and answer Yes at the autostart step. The prompts start from your current settings, so Enter keeps them, and setup rewrites `~/.olsvr.toml` without your comments. Setup rewrites the systemd unit and restarts the service (Linux), or copies the new binary into the app bundle and reloads the login agent (macOS). The running saver keeps the old build until it restarts (on macOS, until setup has refreshed the bundle), even though `olsvr --version` already prints the new version; [Troubleshooting](#troubleshooting) shows how to tell which build runs. If you start olsvr from your compositor's config instead of the service, answer No at the autostart step and restart olsvr yourself.
 
 ---
 
@@ -98,7 +104,7 @@ Running `olsvr setup` (or just `olsvr` on first run) starts an interactive wizar
 4. **Preview:** an optional live preview of your settings; press Enter in the terminal to end it
 5. **Autostart:** optionally install a systemd user service (Linux) or a launchd login agent (macOS) that starts on login
 
-Before the autostart step you can change timing, display or weather again, or start over. The wizard writes `~/.olsvr.toml` and can be re-run at any time; its prompts start from the current settings, so Enter keeps them. If the existing file does not parse, the wizard copies it to `~/.olsvr.toml.bak` and starts from the defaults.
+Before the autostart step you can change timing, display or weather again, or start over. The wizard writes `~/.olsvr.toml` and can be re-run at any time; its prompts start from the current settings, so Enter keeps them. It rewrites the whole file, so comments in it are lost. If the existing file does not parse, the wizard copies it to `~/.olsvr.toml.bak` and starts from the defaults.
 
 ---
 
@@ -113,7 +119,7 @@ At the autostart step, the wizard writes `~/.config/systemd/user/olsvr.service`,
 - restarts olsvr after a failure, at most 5 times a minute, but not after exit status 3 (no Wayland compositor) or 4 (already running)
 - unsets `DISPLAY` and `XAUTHORITY` (see [NVIDIA](#nvidia-linux))
 
-[`olsvr.service`](olsvr.service) in this repository is the same unit with `%h/.cargo/bin/olsvr` as the binary. To install it by hand instead:
+[`olsvr.service`](olsvr.service) in this repository is the same unit with `%h/.cargo/bin/olsvr` as the binary. To install it by hand instead, run this from a clone of the repository:
 
 ```bash
 mkdir -p ~/.config/systemd/user
@@ -134,7 +140,13 @@ exec olsvr run
 exec-once = olsvr run
 ```
 
-Use one starter, not both: a second copy exits with status 4. If you start `graphical-session.target` yourself, import `WAYLAND_DISPLAY` into the systemd user manager first (`systemctl --user import-environment WAYLAND_DISPLAY`). Otherwise the unit exits with status 3 and stays down until `systemctl --user restart olsvr` or the next login.
+Use one starter, not both: a second copy exits with status 4. If you start `graphical-session.target` yourself, import `WAYLAND_DISPLAY` into the systemd user manager first:
+
+```bash
+systemctl --user import-environment WAYLAND_DISPLAY
+```
+
+Otherwise the unit exits with status 3 and stays down until you restart it or log in again.
 
 ### macOS (launchd)
 
@@ -146,15 +158,28 @@ Run `olsvr setup` from the `olsvr` that `cargo install` put on your `PATH`: setu
 
 ## Configuration
 
-Settings live in `~/.olsvr.toml`. All fields are optional; defaults are used for anything omitted. The setup wizard (`olsvr setup`) is the easiest way to configure everything.
+Settings live in `~/.olsvr.toml`. All fields are optional; defaults are used for anything omitted. The setup wizard (`olsvr setup`) is the easiest way to set the timing, display and weather values. It does not ask about `[activation]`, so edit the file for that table.
 
-olsvr checks the values when it starts. It logs each value it cannot use as an error and uses that field's default instead, and if the file does not parse, it logs why and runs with the default settings.
+olsvr reads and checks the file once, when it starts. It logs each value it cannot use as an error and uses that field's default instead, and if the file does not parse, it logs why and runs with the default settings. After editing the file by hand, restart olsvr.
+
+Linux:
+
+```bash
+systemctl --user restart olsvr
+```
+
+macOS:
+
+```bash
+olsvr stop
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.laveez.olsvr.plist
+```
 
 ### General
 
 | Field | Description | Default |
 |---|---|---|
-| `timeout` | Idle time before the saver shows, in minutes (at least 1) | `5` |
+| `timeout` | Idle time before the saver shows, in whole minutes (at least 1) | `5` |
 
 ### Clock
 
@@ -167,8 +192,8 @@ The clock settings work as top-level keys, or in a `[[layers]]` table with `type
 | `time_format` | `24h` or `12h` | `24h` |
 | `date_format` | [chrono format string](https://docs.rs/chrono/latest/chrono/format/strftime/) | `%a %d %b` |
 | `color` | Text color `[r, g, b]`, 0 to 255 each; the wizard's brightness scales it | `[255, 255, 255]` |
-| `hold` | Time the clock stays fully visible between fades, in seconds | `10` |
-| `fade_duration` | Fade-in and fade-out time, in milliseconds | `1500` |
+| `hold` | Time the clock stays fully visible between fades, in whole seconds | `10` |
+| `fade_duration` | Fade-in and fade-out time, in whole milliseconds | `1500` |
 | `edge_padding` | Minimum distance from the screen edges, in pixels (0 to 10000) | `50` |
 
 The generic families map to fixed fonts: `sans-serif` to Open Sans, `serif` to DejaVu Serif, `monospace` to Noto Sans Mono, `cursive` to Comic Sans MS, and `fantasy` to Impact (Papyrus on macOS). When that font is not installed, the text falls back to another font, so naming an installed font gives a predictable result. The wizard offers the generic families and keeps a font name you already set.
@@ -188,7 +213,7 @@ The overlay is a `[[layers]]` table with `type = "weather"`:
 
 ### Activation
 
-The `[activation]` table sets which displays the saver covers and what it keeps awake.
+The `[activation]` table sets which displays the saver covers and what it keeps awake. The wizard keeps what you set here; only its Start over choice resets the table to the defaults.
 
 | Field | Description | Default |
 |---|---|---|
@@ -307,25 +332,34 @@ On Wayland, olsvr learns about idle through `ext-idle-notify-v1` where the compo
 - A GPU with a Vulkan driver (wgpu's Vulkan backend); the Vulkan loader and libwayland are loaded at runtime
 - To build: a C compiler, pkg-config, and the libdbus and libxkbcommon development files
 
+Debian and Ubuntu:
+
 ```bash
-# Debian, Ubuntu
 sudo apt install build-essential pkg-config libdbus-1-dev libxkbcommon-dev
-# Fedora
+```
+
+Fedora:
+
+```bash
 sudo dnf install gcc pkgconf-pkg-config dbus-devel libxkbcommon-devel
-# Arch
+```
+
+Arch:
+
+```bash
 sudo pacman -S --needed base-devel pkgconf dbus libxkbcommon
 ```
 
 **macOS:**
 
-- macOS 11 (Big Sur) or newer, tested on Apple silicon; renders with Metal via wgpu
+- macOS 11 (Big Sur) or newer, tested on Apple silicon; renders with Metal via wgpu, on the low-power GPU of a Mac that has two (`WGPU_POWER_PREF=high` picks the other)
 - Xcode Command Line Tools for the C compiler and linker (`xcode-select --install`)
 
 ---
 
 ## Troubleshooting
 
-**Logs.** olsvr logs at info level by default. Set `RUST_LOG` for more, such as `RUST_LOG=olsvr=debug`.
+**Logs.** olsvr logs at info level by default.
 
 | olsvr runs as | Log |
 |---|---|
@@ -333,14 +367,22 @@ sudo pacman -S --needed base-devel pkgconf dbus libxkbcommon
 | launchd agent (macOS) | `~/Library/Logs/olsvr.log` |
 | `olsvr run` in a terminal | the terminal |
 
-**Which build runs.** `olsvr --version` prints the version of the `olsvr` on your `PATH`. The running saver logs `olsvr <version> (<path>)` when it starts, and after an upgrade the two differ until you re-run `olsvr setup`. On macOS the agent runs the copy in the app bundle; `~/Applications/olsvr.app/Contents/MacOS/olsvr --version` prints its version.
+For more detail, stop the service or agent and run olsvr in a terminal with a higher `RUST_LOG` level. A `RUST_LOG` set in your shell does not reach the service or agent, which set their own.
+
+```bash
+olsvr stop
+RUST_LOG=olsvr=debug olsvr run
+```
+
+**Which build runs.** `olsvr --version` prints the version of the `olsvr` on your `PATH`. The running saver logs `olsvr <version> (<path>)` when it starts. After an upgrade the two differ until the saver restarts: `olsvr setup` restarts it, and on Linux so does the next login. On macOS the agent runs the copy in the app bundle, which only `olsvr setup` replaces; `~/Applications/olsvr.app/Contents/MacOS/olsvr --version` prints its version.
 
 **The saver does not show.**
 
-- `olsvr is already running (PID <pid>)`: another instance holds the PID file; stop it with `olsvr stop`.
+- `olsvr is already running (PID <pid>)`: another instance holds the PID file (`$XDG_RUNTIME_DIR/olsvr.pid` on Linux, `~/Library/Application Support/olsvr/olsvr.pid` on macOS); stop it with `olsvr stop`.
 - Another app holds idle off (see [Keep-Awake and Locking](#keep-awake-and-locking)). On macOS the log says `Not activating while "<app>" (pid <pid>) holds a display-sleep assertion`; on GNOME the skip is logged at debug level.
 - The session is locked: olsvr does not show over a lock screen (GNOME, macOS).
-- Linux: after a failed GPU init, olsvr does not activate for 10 minutes (`GPU init failed, not activating for the next 10 min`); see [NVIDIA](#nvidia-linux) for one cause.
+- Linux: after a failed GPU init, olsvr does not activate for 10 minutes (`GPU init failed, not activating for the next 10 min`); see [NVIDIA](#nvidia-linux) for one cause. During the pause `olsvr run --activate` and `olsvr run --now` beside the running instance report success, but the saver does not show; the log says `GPU init failed recently, not activating for another ...`
+- A GPU error or a lost GPU device hides the saver at once and logs `GPU error: ...` or `GPU device lost (...)`. The saver comes back after another full `timeout` if you are still away.
 - macOS: after the agent starts or restarts, the first show waits one full `timeout`.
 
 ### NVIDIA (Linux)
@@ -368,16 +410,32 @@ Contributions are welcome! Open an issue or submit a PR.
 ```bash
 git clone https://github.com/laveez/olsvr.git
 cd olsvr
-git config core.hooksPath .githooks  # Enable pre-push fmt/clippy/test checks
+git config core.hooksPath .githooks
 cargo build
 ```
 
-Stop an installed olsvr with `olsvr stop` before you run a build from the tree. Beside a running instance, `run` exits with status 4, and `run --now` shows the installed saver on Linux or exits with status 4 on macOS. Afterwards, `systemctl --user start olsvr` (Linux) or `launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.laveez.olsvr.plist` (macOS) brings the installed one back.
+The `core.hooksPath` line enables the pre-push fmt, clippy and test checks.
+
+Stop an installed olsvr with `olsvr stop` before you run a build from the tree. Beside a running instance, `run` exits with status 4, and `run --now` shows the installed saver on Linux or exits with status 4 on macOS.
 
 ```bash
-cargo run -- run --now                  # Preview the screensaver
-cargo run -- run --now --debug          # Preview with the debug overlay (Linux)
-RUST_LOG=olsvr=debug cargo run -- run   # Run in the foreground with debug logs
+cargo run -- run --now
+cargo run -- run --now --debug
+RUST_LOG=olsvr=debug cargo run -- run
+```
+
+The first line previews the saver, the second adds the debug overlay (Linux only), and the third runs in the foreground with debug logs. Afterwards, bring the installed one back.
+
+Linux:
+
+```bash
+systemctl --user start olsvr
+```
+
+macOS:
+
+```bash
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.laveez.olsvr.plist
 ```
 
 CI runs `cargo fmt --check`; clippy, the tests and a release build on Linux and macOS; `cargo check` on Rust 1.89, the minimum supported version; and a RustSec advisory check with cargo-deny.

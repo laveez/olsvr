@@ -1,3 +1,5 @@
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use dialoguer::{Input, Select, theme::ColorfulTheme};
@@ -779,19 +781,39 @@ fn report_autostart_state() -> bool {
     true
 }
 
-/// Writes `contents` to a file beside `path` and renames it over `path`, so that a failed write
-/// leaves the old file whole. A symlink at `path`, such as one from a dotfiles manager, stays,
-/// and the file it points to is replaced.
+/// Writes `contents` to a file beside `path`'s target and renames it over the target, so that a
+/// failed write leaves the old file whole. A symlink at `path`, such as one from a dotfiles
+/// manager, stays, and the file it points to is replaced or created.
 fn write_replacing(path: &str, contents: &str) -> std::io::Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+    let target = link_target(Path::new(path));
     let mut staged = target.clone().into_os_string();
-    staged.push(".new");
-    let written =
-        std::fs::write(&staged, contents).and_then(|()| std::fs::rename(&staged, &target));
+    // Named after this process, so that two setups at once never write into the same file
+    staged.push(format!(".{}.new", std::process::id()));
+    let _ = std::fs::remove_file(&staged);
+    let written = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staged)
+        .and_then(|mut file| file.write_all(contents.as_bytes()))
+        .and_then(|()| std::fs::rename(&staged, &target));
     if written.is_err() {
         let _ = std::fs::remove_file(&staged);
     }
     written
+}
+
+/// The file a write to `path` lands in: where the symlinks at `path` lead, even when that file
+/// does not exist yet, or `path` itself.
+fn link_target(path: &Path) -> PathBuf {
+    let mut target = path.to_path_buf();
+    // Linux's own limit on symlinks followed in one lookup
+    for _ in 0..40 {
+        let Ok(link) = std::fs::read_link(&target) else {
+            break;
+        };
+        target = target.parent().map_or(link.clone(), |dir| dir.join(&link));
+    }
+    target
 }
 
 #[cfg(target_os = "linux")]
@@ -1200,35 +1222,18 @@ fn report_service_state() -> bool {
     false
 }
 
-/// launchd shows a `pid` line for a job it has started. The PID lock is the second opinion,
-/// which an agent that still runs a build from before the lock does not give. Its holder counts
-/// only when launchd, PID 1, is its parent, because an `olsvr run` started by hand holds the lock
-/// too.
+/// launchd shows a `pid` line for a job it has started. Only that counts: an `olsvr run` started
+/// by hand also holds the PID lock, and outlives its terminal as a child of launchd.
 #[cfg(target_os = "macos")]
 fn agent_running() -> bool {
     let printed = Command::new("launchctl")
         .args(["print", &launchd_target()])
         .output();
-    let has_pid = printed.is_ok_and(|output| {
+    printed.is_ok_and(|output| {
         String::from_utf8_lossy(&output.stdout).lines().any(|line| {
             line.trim()
                 .strip_prefix("pid = ")
                 .is_some_and(|pid| pid.parse::<u32>().is_ok())
         })
-    });
-    has_pid
-        || matches!(pidfile::running_pid(&pidfile::path()), Ok(Some(pid)) if parent_pid(pid) == Some(1))
-}
-
-/// The parent of process `pid`, or `None` if it cannot be read, e.g. because the process has
-/// exited.
-#[cfg(target_os = "macos")]
-fn parent_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
-    // SAFETY: proc_bsdinfo holds only integers and byte arrays, so all zeros is a valid value.
-    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-    // SAFETY: `info` is writable for the `size` bytes passed.
-    let written =
-        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
-    (written == size).then_some(info.pbi_ppid as libc::pid_t)
+    })
 }

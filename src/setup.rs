@@ -946,6 +946,9 @@ fn print_session_note() {
 /// (the caller then falls back to the bare binary).
 #[cfg(target_os = "macos")]
 fn create_app_bundle() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    use std::os::unix::process::CommandExt;
+
     let home = std::env::var("HOME").ok()?;
     let app_dir = format!("{home}/Applications/olsvr.app");
     let macos_dir = format!("{app_dir}/Contents/MacOS");
@@ -958,11 +961,23 @@ fn create_app_bundle() -> Option<String> {
     }
 
     // Copy (not symlink) so the bundle is self-contained and LaunchServices reads
-    // its Info.plist; re-run setup after upgrading to refresh the copy.
+    // its Info.plist; re-run setup after upgrading to refresh the copy. The copy is renamed
+    // over the executable instead of written onto it: a write rewrites the same inode in place,
+    // under the code signature macOS has cached for it.
     let src = std::env::current_exe().ok()?;
-    if let Err(e) = std::fs::copy(&src, &exe_dst) {
-        eprintln!("Failed to copy binary into app bundle: {e}");
-        return None;
+    let same_file = match (std::fs::metadata(&src), std::fs::metadata(&exe_dst)) {
+        (Ok(from), Ok(to)) => from.dev() == to.dev() && from.ino() == to.ino(),
+        _ => false,
+    };
+    if !same_file {
+        let staged = format!("{exe_dst}.new");
+        let _ = std::fs::remove_file(&staged);
+        let copied = std::fs::copy(&src, &staged).and_then(|_| std::fs::rename(&staged, &exe_dst));
+        if let Err(e) = copied {
+            let _ = std::fs::remove_file(&staged);
+            eprintln!("Failed to copy binary into app bundle: {e}");
+            return None;
+        }
     }
 
     let info = format!(
@@ -1002,9 +1017,11 @@ fn create_app_bundle() -> Option<String> {
     // Ad-hoc codesign the bundle. The linker's signature on the bare binary fails
     // validation once it is a bundle's main executable, so the agent gets
     // AMFI-killed at launch (SIGKILL, OS_REASON_CODESIGNING) unless re-signed in
-    // the bundle context.
+    // the bundle context. It runs in its own process group, so that a Ctrl-C, which the wizard
+    // ignores here, cannot cut the signing short.
     let signed = Command::new("codesign")
         .args(["--force", "--sign", "-", &app_dir])
+        .process_group(0)
         .status()
         .map(|s| s.success())
         .unwrap_or(false);
@@ -1019,6 +1036,13 @@ fn create_app_bundle() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(target_os = "macos")]
 fn install_launchd_agent() -> bool {
     let home = std::env::var("HOME").expect("HOME not set");
     let label = crate::LAUNCHD_LABEL;
@@ -1030,6 +1054,11 @@ fn install_launchd_agent() -> bool {
         return false;
     }
 
+    // The agent runs from the bundle, so it stops before the bundle changes
+    let _sigint = IgnoreSigint::new();
+    let agent_was_loaded = autostart_active();
+    stop_autostart_service();
+
     // Launch from the LSUIElement app bundle so the agent has no Dock icon; fall
     // back to the bare installed binary if the bundle couldn't be created.
     let exe = create_app_bundle().unwrap_or_else(|| {
@@ -1038,6 +1067,9 @@ fn install_launchd_agent() -> bool {
             .and_then(|p| p.to_str().map(str::to_owned))
             .unwrap_or_else(|| format!("{home}/.cargo/bin/olsvr"))
     });
+
+    let exe = xml_escape(&exe);
+    let log_path = xml_escape(&format!("{home}/Library/Logs/olsvr.log"));
 
     // KeepAlive true: launchd respawns the agent after any exit, so a quit event cannot
     // leave it dead; respawns are at least ThrottleInterval apart. `olsvr stop` and
@@ -1066,9 +1098,9 @@ fn install_launchd_agent() -> bool {
     <string>info</string>
   </dict>
   <key>StandardOutPath</key>
-  <string>{home}/Library/Logs/olsvr.log</string>
+  <string>{log_path}</string>
   <key>StandardErrorPath</key>
-  <string>{home}/Library/Logs/olsvr.log</string>
+  <string>{log_path}</string>
   <key>ThrottleInterval</key>
   <integer>30</integer>
 </dict>
@@ -1078,6 +1110,9 @@ fn install_launchd_agent() -> bool {
 
     if let Err(e) = std::fs::write(&plist_path, plist) {
         eprintln!("Failed to write launchd plist: {e}");
+        if agent_was_loaded {
+            start_autostart_service();
+        }
         return false;
     }
     println!("  Installed agent to {plist_path}");

@@ -973,7 +973,8 @@ pub fn run(args: RunArgs) {
         .expect("Initial dispatch failed");
 
     if let (Some(notifier), Some(seat)) = (&app.idle_notifier, &app.seat) {
-        let timeout_ms = app.config.timeout * 60 * 1000;
+        let timeout_ms =
+            u32::try_from(u64::from(app.config.timeout).saturating_mul(60_000)).unwrap_or(u32::MAX);
         log::info!("Setting up Wayland idle notification: {}ms", timeout_ms);
         let notification = notifier.get_idle_notification(timeout_ms, seat, &qh, ());
         app.idle_notification = Some(notification);

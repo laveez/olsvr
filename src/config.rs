@@ -1,5 +1,7 @@
+use std::ops::RangeInclusive;
 use std::path::PathBuf;
 
+use chrono::format::StrftimeItems;
 use serde::{Deserialize, Serialize};
 
 use crate::layer::Layer;
@@ -95,17 +97,78 @@ impl Config {
     }
 
     pub fn load() -> Self {
+        Self::try_load().unwrap_or_else(|e| {
+            log::error!("Using the default settings: {e}");
+            Self::default()
+        })
+    }
+
+    /// Like `load`, but a file that cannot be read or parsed is an error instead of the defaults.
+    pub fn try_load() -> Result<Self, String> {
         let path = Self::path();
-        if path.exists() {
-            match std::fs::read_to_string(&path) {
-                Ok(contents) => match toml::from_str(&contents) {
-                    Ok(config) => return config,
-                    Err(e) => log::warn!("Failed to parse {}: {e}, using defaults", path.display()),
-                },
-                Err(e) => log::warn!("Failed to read {}: {e}, using defaults", path.display()),
-            }
+        if !path.exists() {
+            return Ok(Self::default());
         }
-        Self::default()
+        let contents = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read {}: {e}", path.display()))?;
+        toml::from_str(&contents).map_err(|e| format!("Failed to parse {}: {e}", path.display()))
+    }
+
+    /// Replaces each value the layers cannot use, in the flat fields and in every `[[layers]]`
+    /// table, with its default, and describes each replacement.
+    pub fn validate(&mut self) -> Vec<String> {
+        let defaults = Self::default();
+        let mut problems = Vec::new();
+        // At 0 the macOS saver comes back at the first poll after every dismiss, and the GNOME
+        // idle monitor activates once and then never again.
+        if self.timeout == 0 {
+            problems.push(format!(
+                "timeout = 0 is not at least 1 minute, using {}",
+                defaults.timeout
+            ));
+            self.timeout = defaults.timeout;
+        }
+        if !EDGE_PADDINGS.contains(&i64::from(self.edge_padding)) {
+            problems.push(format!(
+                "edge_padding = {} is not {EDGE_PADDING_RULE}, using {}",
+                self.edge_padding, defaults.edge_padding
+            ));
+            self.edge_padding = defaults.edge_padding;
+        }
+        if !FONT_SIZES.contains(&i64::from(self.font_size)) {
+            problems.push(format!(
+                "font_size = {} is not {FONT_SIZE_RULE}, using {}",
+                self.font_size, defaults.font_size
+            ));
+            self.font_size = defaults.font_size;
+        }
+        if !is_time_format(&self.time_format) {
+            problems.push(format!(
+                "time_format = {:?} is not {TIME_FORMAT_RULE}, using {:?}",
+                self.time_format, defaults.time_format
+            ));
+            self.time_format = defaults.time_format;
+        }
+        if !is_date_format(&self.date_format) {
+            problems.push(format!(
+                "date_format = {:?} is not {DATE_FORMAT_RULE}, using {:?}",
+                self.date_format, defaults.date_format
+            ));
+            self.date_format = defaults.date_format;
+        }
+        for (i, table) in self.layers.iter_mut().flatten().enumerate() {
+            table.retain(|key, value| match broken_layer_rule(key, value) {
+                Some(rule) => {
+                    problems.push(format!(
+                        "layer {}: {key} = {value} is not {rule}, using the default",
+                        i + 1
+                    ));
+                    false
+                }
+                None => true,
+            });
+        }
+        problems
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -119,12 +182,19 @@ impl Config {
         let (mut layer_list, mut layer_configs) = if let Some(ref layers_cfg) = self.layers {
             let mut list = Vec::new();
             let mut cfgs = Vec::new();
-            for table in layers_cfg {
+            for (i, table) in layers_cfg.iter().enumerate() {
                 let layer_type = table
                     .get("type")
                     .and_then(|v| v.as_str())
                     .unwrap_or("clock");
-                list.push(layers::create_layer(layer_type));
+                let Some(layer) = layers::create_layer(layer_type) else {
+                    log::error!(
+                        "Config: layer {}: type = {layer_type:?} is unknown, skipping the layer",
+                        i + 1
+                    );
+                    continue;
+                };
+                list.push(layer);
                 cfgs.push(table.clone());
             }
             (list, cfgs)
@@ -166,11 +236,14 @@ impl Config {
                 "edge_padding".into(),
                 toml::Value::Integer(self.edge_padding as i64),
             );
-            (vec![layers::create_layer("clock")], vec![table])
+            (
+                layers::create_layer("clock").into_iter().collect(),
+                vec![table],
+            )
         };
 
         if debug {
-            layer_list.push(layers::create_layer("debug"));
+            layer_list.extend(layers::create_layer("debug"));
             layer_configs.push(toml::value::Table::new());
         }
 
@@ -197,6 +270,56 @@ impl Config {
         }
         None
     }
+}
+
+const FONT_SIZES: RangeInclusive<i64> = 1..=2000;
+const FONT_SIZE_RULE: &str = "a whole number from 1 to 2000";
+/// Wider than an 8K display (7680 px). From about 2^24, `pad + 1.0 == pad` in f32, and the empty
+/// range panics `Animation::random_position`.
+const EDGE_PADDINGS: RangeInclusive<i64> = 0..=10000;
+const EDGE_PADDING_RULE: &str = "a whole number from 0 to 10000";
+const TIME_FORMAT_RULE: &str = r#""24h" or "12h""#;
+const DATE_FORMAT_RULE: &str = "a valid chrono date format";
+
+fn is_time_format(format: &str) -> bool {
+    matches!(format, "24h" | "12h")
+}
+
+fn is_date_format(format: &str) -> bool {
+    StrftimeItems::new(format).parse().is_ok()
+}
+
+/// The rule `value` breaks, for the `[[layers]]` keys whose values the layers convert.
+fn broken_layer_rule(key: &str, value: &toml::Value) -> Option<&'static str> {
+    let (valid, rule) = match key {
+        "font_size" => (
+            value.as_integer().is_some_and(|n| FONT_SIZES.contains(&n)),
+            FONT_SIZE_RULE,
+        ),
+        "hold" | "fade_duration" => (
+            value.as_integer().is_some_and(|n| u32::try_from(n).is_ok()),
+            "a whole number from 0 to 4294967295",
+        ),
+        "edge_padding" => (
+            value
+                .as_integer()
+                .is_some_and(|n| EDGE_PADDINGS.contains(&n)),
+            EDGE_PADDING_RULE,
+        ),
+        "color" => (
+            value.as_array().is_some_and(|rgb| {
+                rgb.len() == 3
+                    && rgb
+                        .iter()
+                        .all(|c| c.as_integer().is_some_and(|n| u8::try_from(n).is_ok()))
+            }),
+            "three whole numbers from 0 to 255",
+        ),
+        "time_format" => (value.as_str().is_some_and(is_time_format), TIME_FORMAT_RULE),
+        "date_format" => (value.as_str().is_some_and(is_date_format), DATE_FORMAT_RULE),
+        _ => return None,
+    };
+    (!valid).then_some(rule)
 }
 
 #[cfg(test)]

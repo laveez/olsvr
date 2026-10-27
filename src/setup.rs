@@ -60,7 +60,10 @@ pub fn run() {
     let mut config = if Config::exists() {
         println!("  Found existing config at {}", Config::path().display());
         println!();
-        Config::load()
+        let Some(config) = load_or_back_up() else {
+            return;
+        };
+        config
     } else {
         Config::default()
     };
@@ -149,6 +152,29 @@ pub fn run() {
     println!();
 }
 
+/// The existing config, or the defaults once a file that does not load has been copied to
+/// `~/.olsvr.toml.bak`. `None` when that copy fails, because saving would then destroy the file.
+fn load_or_back_up() -> Option<Config> {
+    let error = match Config::try_load() {
+        Ok(config) => return Some(config),
+        Err(e) => e,
+    };
+    eprintln!("  {error}");
+    let backup = Config::path().with_extension("toml.bak");
+    if let Err(e) = std::fs::copy(Config::path(), &backup) {
+        eprintln!(
+            "  Setup stopped: the file could not be copied to {}: {e}",
+            backup.display()
+        );
+        return None;
+    }
+    eprintln!(
+        "  Copied the file to {}. Setup starts from the defaults.",
+        backup.display()
+    );
+    Some(Config::default())
+}
+
 fn prompt_timing(theme: &ColorfulTheme, config: &mut Config) {
     println!();
     println!("  -- Timing --");
@@ -157,6 +183,13 @@ fn prompt_timing(theme: &ColorfulTheme, config: &mut Config) {
     config.timeout = Input::with_theme(theme)
         .with_prompt("Idle timeout (minutes)")
         .default(config.timeout)
+        .validate_with(|minutes: &u32| {
+            if *minutes >= 1 {
+                Ok(())
+            } else {
+                Err("The timeout must be at least 1 minute")
+            }
+        })
         .interact_text()
         .unwrap();
 

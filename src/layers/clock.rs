@@ -1,3 +1,4 @@
+use std::fmt::Write;
 use std::sync::{Arc, RwLock};
 
 use glyphon::{
@@ -8,6 +9,8 @@ use glyphon::{
 use crate::animation::Animation;
 use crate::data::DataCache;
 use crate::layer::{GpuContext, Layer};
+
+const DEFAULT_DATE_FORMAT: &str = "%a %d %b";
 
 pub struct ClockLayer {
     time_buffer: Option<Buffer>,
@@ -39,7 +42,7 @@ impl Default for ClockLayer {
             font_size: 200.0,
             font_family: "sans-serif".into(),
             time_format: "24h".into(),
-            date_format: "%a %d %b".into(),
+            date_format: DEFAULT_DATE_FORMAT.into(),
             text_color: [255, 255, 255],
             hold: 10,
             fade_duration: 1500,
@@ -211,7 +214,10 @@ impl Layer for ClockLayer {
             _ => "%H:%M",
         };
         let time_str = now.format(time_fmt).to_string();
-        let date_str = now.format(&self.date_format).to_string();
+        let mut date_str = String::new();
+        if write!(date_str, "{}", now.format(&self.date_format)).is_err() {
+            date_str = now.format(DEFAULT_DATE_FORMAT).to_string();
+        }
 
         if let Some(ref mut buf) = self.time_buffer {
             let family = parse_family(&self.font_family);

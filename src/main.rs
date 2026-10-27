@@ -34,7 +34,7 @@ enum Command {
 #[derive(Parser)]
 pub(crate) struct RunArgs {
     /// Idle timeout in minutes before activation
-    #[arg(long)]
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
     pub timeout: Option<u32>,
 
     /// Send SIGUSR1 to a running instance to activate it (Linux only)
@@ -82,6 +82,8 @@ pub(crate) fn pid_path() -> PathBuf {
     std::env::temp_dir().join("olsvr.pid")
 }
 
+/// Applies the command-line overrides, then validates the result, so a bad value from either
+/// source is replaced before any layer reads it.
 pub(crate) fn merge_cli(config: &mut Config, args: &RunArgs) {
     if let Some(v) = args.timeout {
         config.timeout = v;
@@ -97,6 +99,9 @@ pub(crate) fn merge_cli(config: &mut Config, args: &RunArgs) {
     }
     if let Some(v) = args.edge_padding {
         config.edge_padding = v;
+    }
+    for problem in config.validate() {
+        log::error!("Config: {problem}");
     }
 }
 

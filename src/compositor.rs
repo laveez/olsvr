@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -45,6 +46,8 @@ pub struct Compositor {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    /// Set by `watch_gpu_errors` when the device is lost or reports an error.
+    gpu_failed: Arc<AtomicBool>,
     config: wgpu::SurfaceConfiguration,
     font_system: FontSystem,
     swash_cache: SwashCache,
@@ -141,6 +144,15 @@ impl Compositor {
         // instead of aborting the whole process on a GPU init failure.
         let adapter =
             match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                // `None` takes the first adapter, the discrete GPU on a dual-GPU Mac.
+                // WGPU_POWER_PREF overrides.
+                power_preference: wgpu::PowerPreference::from_env().unwrap_or(
+                    if cfg!(target_os = "macos") {
+                        wgpu::PowerPreference::LowPower
+                    } else {
+                        wgpu::PowerPreference::None
+                    },
+                ),
                 compatible_surface: Some(&surface),
                 ..Default::default()
             })) {
@@ -157,6 +169,7 @@ impl Compositor {
             // Use the adapter's real limits so large HiDPI surfaces (e.g. a 2x
             // 5120x1440 panel = 10240x2880) fit; the default caps texture size at 8192.
             required_limits: adapter.limits(),
+            memory_hints: wgpu::MemoryHints::MemoryUsage,
             ..Default::default()
         }));
         let (device, queue) = match device_queue {
@@ -166,6 +179,7 @@ impl Compositor {
                 return None;
             }
         };
+        let gpu_failed = watch_gpu_errors(&device);
 
         // Some displays report a physical (HiDPI) size larger than the GPU's max
         // texture dimension; clamp the surface so configure() can't fail. The
@@ -229,6 +243,7 @@ impl Compositor {
             surface,
             device,
             queue,
+            gpu_failed,
             config,
             font_system,
             swash_cache,
@@ -311,8 +326,12 @@ impl Compositor {
     }
 
     /// Render one frame; skipped frames (timeout/occluded) are counted and logged at debug.
+    /// `Broken` once the device is lost or wgpu reports an error.
     #[must_use]
     pub fn render_frame(&mut self, debug_info: Option<&DebugInfo>) -> FrameOutcome {
+        if self.gpu_failed() {
+            return FrameOutcome::Broken;
+        }
         // Summarize skipped frames at most once per second (a brief burst at show time is normal).
         if self.skips > 0 && self.last_skip_log.elapsed().as_secs() >= 1 {
             log::debug!(
@@ -355,6 +374,9 @@ impl Compositor {
         // wgpu, so a suboptimal surface is reconfigured only after its frame is presented.
         if suboptimal {
             self.surface.configure(&self.device, &self.config);
+        }
+        if self.gpu_failed() {
+            return FrameOutcome::Broken;
         }
 
         if (texture_ms > 50 || submit_ms > 50 || present_ms > 50)
@@ -413,6 +435,10 @@ impl Compositor {
                 self.skips += 1;
                 Err(FrameOutcome::Skipped)
             }
+            // A failed acquire reports its own error or the device loss to `watch_gpu_errors`.
+            wgpu::CurrentSurfaceTexture::Validation if self.gpu_failed() => {
+                Err(FrameOutcome::Broken)
+            }
             wgpu::CurrentSurfaceTexture::Validation => Err(self.validation_error()),
             wgpu::CurrentSurfaceTexture::Lost => {
                 log::error!("Surface lost");
@@ -429,18 +455,22 @@ impl Compositor {
         self.validation_errors += 1;
         if self.validation_errors >= MAX_VALIDATION_ERRORS {
             log::error!(
-                "Surface texture validation failed {} times in a row",
+                "Surface texture validation error or lost device, {} times in a row",
                 self.validation_errors
             );
             return FrameOutcome::Broken;
         }
         if warning_due(&mut self.last_validation_warn) {
             log::warn!(
-                "Surface texture validation error ({} in a row), skipping frame",
+                "Surface texture validation error or lost device ({} in a row), skipping frame",
                 self.validation_errors
             );
         }
         FrameOutcome::Skipped
+    }
+
+    fn gpu_failed(&self) -> bool {
+        self.gpu_failed.load(Ordering::Acquire)
     }
 
     /// Upload the viewport and the layers' glyphs. False when the text cannot be drawn
@@ -505,4 +535,26 @@ impl Compositor {
         drop(pass);
         encoder.finish()
     }
+}
+
+/// wgpu panics on an uncaptured error unless a handler is set, and reports a lost device only
+/// through its callback. Both set the returned flag, and `render_frame` reports `Broken` from
+/// then on.
+fn watch_gpu_errors(device: &wgpu::Device) -> Arc<AtomicBool> {
+    let failed = Arc::new(AtomicBool::new(false));
+    let lost = Arc::clone(&failed);
+    device.set_device_lost_callback(move |reason, message| {
+        log::error!("GPU device lost ({reason:?}): {message}");
+        lost.store(true, Ordering::Release);
+    });
+    let errored = Arc::clone(&failed);
+    device.on_uncaptured_error(Arc::new(move |error: wgpu::Error| {
+        // The first error already breaks the renderer; the ones after it are its consequences.
+        if errored.swap(true, Ordering::AcqRel) {
+            log::debug!("Further GPU error: {error}");
+        } else {
+            log::error!("GPU error: {error}");
+        }
+    }));
+    failed
 }

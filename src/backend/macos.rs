@@ -396,7 +396,9 @@ impl Watchdog {
         if active {
             self.beat();
         }
-        self.active.store(active, Ordering::Relaxed);
+        // Release, so a watchdog thread that sees the arming also sees the beat above, not the
+        // last beat of the previous show.
+        self.active.store(active, Ordering::Release);
     }
 
     fn spawn(self: &Arc<Self>) {
@@ -405,7 +407,7 @@ impl Watchdog {
         std::thread::spawn(move || {
             loop {
                 std::thread::sleep(Duration::from_secs(1));
-                if !wd.active.load(Ordering::Relaxed) {
+                if !wd.active.load(Ordering::Acquire) {
                     continue;
                 }
                 let elapsed = wd.start.elapsed().as_millis() as u64;
@@ -899,8 +901,8 @@ impl ApplicationHandler for MacApp {
                     // would spin; `about_to_wait` retries at the poll rate instead.
                     FrameOutcome::Skipped => t.needs_retry = true,
                 }
-                // Any completed render is a heartbeat: the watchdog exists to catch
-                // a hung loop, and a skipped frame (occluded surface, sleeping
+                // A presented or skipped frame is a heartbeat: the watchdog exists to
+                // catch a hung loop, and a skipped frame (occluded surface, sleeping
                 // display) means there is nothing to draw, not that a black window
                 // is trapping the screen.
                 self.watchdog.beat();

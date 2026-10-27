@@ -266,7 +266,7 @@ fn wizard() -> bool {
 /// Shows the preview with the autostart service stopped, and starts the service again after.
 /// `false` when the service does not come back.
 fn run_preview() -> bool {
-    let _sigint = IgnoreSigint::new();
+    let _interrupts = IgnoreInterrupts::new();
     let autostart_was_active = autostart_active();
     if autostart_was_active {
         stop_autostart_service();
@@ -293,27 +293,29 @@ fn show_preview() {
     let _ = child.wait();
 }
 
-extern "C" fn ignore_sigint(_: libc::c_int) {}
+extern "C" fn ignore_signal(_: libc::c_int) {}
 
-/// Ctrl-C reaches the wizard and the preview together. While the autostart service is stopped,
-/// only the preview may end on it, so that the wizard can start the service again. A handler
-/// rather than SIG_IGN, because exec resets a handler and the preview keeps the default.
-struct IgnoreSigint(libc::sighandler_t);
+const INTERRUPTS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGHUP];
 
-impl IgnoreSigint {
+/// Ctrl-C and a closing terminal reach the wizard and the preview together. While the autostart
+/// service is stopped, only the preview may end on them, so that the wizard can start the
+/// service again; after a hangup the blocked terminal read fails at once. A handler rather than
+/// SIG_IGN, because exec resets a handler and the preview keeps the default.
+struct IgnoreInterrupts([libc::sighandler_t; 2]);
+
+impl IgnoreInterrupts {
     fn new() -> Self {
-        Self(unsafe {
-            libc::signal(
-                libc::SIGINT,
-                ignore_sigint as *const () as libc::sighandler_t,
-            )
-        })
+        Self(INTERRUPTS.map(|signal| unsafe {
+            libc::signal(signal, ignore_signal as *const () as libc::sighandler_t)
+        }))
     }
 }
 
-impl Drop for IgnoreSigint {
+impl Drop for IgnoreInterrupts {
     fn drop(&mut self) {
-        unsafe { libc::signal(libc::SIGINT, self.0) };
+        for (signal, previous) in INTERRUPTS.into_iter().zip(self.0) {
+            unsafe { libc::signal(signal, previous) };
+        }
     }
 }
 
@@ -675,7 +677,7 @@ fn rebuild_layers(config: &mut Config) {
 
 /// Restarts the autostart service, so that it reads the saved config.
 fn restart_autostart() -> bool {
-    let _sigint = IgnoreSigint::new();
+    let _interrupts = IgnoreInterrupts::new();
     stop_autostart_service();
     // An instance still exiting holds the PID lock, and the new one would be refused
     let _ = pidfile::stop_running();
@@ -1055,7 +1057,7 @@ fn install_launchd_agent() -> bool {
     }
 
     // The agent runs from the bundle, so it stops before the bundle changes
-    let _sigint = IgnoreSigint::new();
+    let _interrupts = IgnoreInterrupts::new();
     let agent_was_loaded = autostart_active();
     stop_autostart_service();
 

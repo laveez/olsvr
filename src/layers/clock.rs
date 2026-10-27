@@ -87,7 +87,7 @@ fn widest_line_w(
     let attrs = Attrs::new().family(family);
     let mut widest = 0.0_f32;
     for text in samples {
-        buffer.set_text(font_system, &text, &attrs, Shaping::Advanced, None);
+        buffer.set_text(&text, &attrs, Shaping::Advanced, None);
         buffer.shape_until_scroll(font_system, false);
         for run in buffer.layout_runs() {
             widest = widest.max(run.line_w);
@@ -175,10 +175,9 @@ impl Layer for ClockLayer {
         self.block_w = time_w.max(date_w);
 
         let mut time_buffer = Buffer::new(font_system, Metrics::new(fs, fs * 1.2));
-        time_buffer.set_wrap(font_system, Wrap::None);
-        time_buffer.set_size(font_system, Some(self.block_w), Some(fs * 1.5));
+        time_buffer.set_wrap(Wrap::None);
+        time_buffer.set_size(Some(self.block_w), Some(fs * 1.5));
         time_buffer.set_text(
-            font_system,
             "00:00",
             &Attrs::new().family(family),
             Shaping::Advanced,
@@ -190,10 +189,9 @@ impl Layer for ClockLayer {
         time_buffer.shape_until_scroll(font_system, false);
 
         let mut date_buffer = Buffer::new(font_system, Metrics::new(date_fs, date_fs * 1.2));
-        date_buffer.set_wrap(font_system, Wrap::None);
-        date_buffer.set_size(font_system, Some(self.block_w), Some(date_fs * 1.5));
+        date_buffer.set_wrap(Wrap::None);
+        date_buffer.set_size(Some(self.block_w), Some(date_fs * 1.5));
         date_buffer.set_text(
-            font_system,
             "Mon 01 Jan",
             &Attrs::new().family(family),
             Shaping::Advanced,
@@ -265,7 +263,6 @@ impl Layer for ClockLayer {
         if let Some(ref mut buf) = self.time_buffer {
             let family = parse_family(&self.font_family);
             buf.set_text(
-                font_system,
                 &time_str,
                 &Attrs::new().family(family),
                 Shaping::Advanced,
@@ -280,7 +277,6 @@ impl Layer for ClockLayer {
         if let Some(ref mut buf) = self.date_buffer {
             let family = parse_family(&self.font_family);
             buf.set_text(
-                font_system,
                 &date_str,
                 &Attrs::new().family(family),
                 Shaping::Advanced,

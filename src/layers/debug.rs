@@ -43,9 +43,8 @@ impl Layer for DebugLayer {
 
         let debug_fs = 14.0;
         let mut buffer = Buffer::new(font_system, Metrics::new(debug_fs, debug_fs * 1.4));
-        buffer.set_size(font_system, Some(500.0), Some(debug_fs * 2.0));
+        buffer.set_size(Some(500.0), Some(debug_fs * 2.0));
         buffer.set_text(
-            font_system,
             "",
             &Attrs::new().family(Family::Monospace),
             Shaping::Advanced,
@@ -84,7 +83,6 @@ impl Layer for DebugLayer {
         };
 
         buffer.set_text(
-            font_system,
             &debug_text,
             &Attrs::new().family(Family::Monospace),
             Shaping::Advanced,

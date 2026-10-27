@@ -12,8 +12,8 @@ keywords = ["wayland", "macos", "screensaver", "oled", "burn-in"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-wgpu = "29"
-glyphon = "0.11"
+wgpu = "30.0.1"
+glyphon = "0.12"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 chrono = "0.4"

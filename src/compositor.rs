@@ -152,6 +152,7 @@ impl Compositor {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
+            color_space: wgpu::SurfaceColorSpace::Auto,
             width,
             height,
             present_mode,
@@ -308,7 +309,7 @@ impl Compositor {
         let submit_ms = t1.elapsed().as_millis();
 
         let t2 = Instant::now();
-        output.present();
+        self.queue.present(output);
         let present_ms = t2.elapsed().as_millis();
 
         // Configuring while a texture acquired from this surface is alive panics in

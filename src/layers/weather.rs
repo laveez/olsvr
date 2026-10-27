@@ -93,9 +93,8 @@ impl Layer for WeatherLayer {
 
         let fs = self.font_size;
         let mut buffer = Buffer::new(font_system, Metrics::new(fs, fs * 1.4));
-        buffer.set_size(font_system, Some(fs * 14.0), Some(fs * 2.0));
+        buffer.set_size(Some(fs * 14.0), Some(fs * 2.0));
         buffer.set_rich_text(
-            font_system,
             [("", Attrs::new().family(Family::SansSerif))],
             &Attrs::new(),
             Shaping::Advanced,
@@ -168,13 +167,7 @@ impl Layer for WeatherLayer {
             vec![]
         };
 
-        buffer.set_rich_text(
-            font_system,
-            spans,
-            &Attrs::new(),
-            Shaping::Advanced,
-            Some(Align::Center),
-        );
+        buffer.set_rich_text(spans, &Attrs::new(), Shaping::Advanced, Some(Align::Center));
         buffer.shape_until_scroll(font_system, false);
     }
 

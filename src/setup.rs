@@ -267,14 +267,11 @@ fn wizard() -> bool {
 /// `false` when the service does not come back.
 fn run_preview() -> bool {
     let _interrupts = IgnoreInterrupts::new();
-    let autostart_was_active = autostart_active();
-    if autostart_was_active {
-        stop_autostart_service();
-    }
-    if stop_running_instance(autostart_was_active) {
+    let stopped = StoppedAutostart::stop();
+    if stop_running_instance(stopped.was_active) {
         show_preview();
     }
-    !autostart_was_active || start_autostart_service()
+    stopped.restart()
 }
 
 fn show_preview() {
@@ -315,6 +312,42 @@ impl Drop for IgnoreInterrupts {
     fn drop(&mut self) {
         for (signal, previous) in INTERRUPTS.into_iter().zip(self.0) {
             unsafe { libc::signal(signal, previous) };
+        }
+    }
+}
+
+/// The autostart service, stopped if it ran. Dropping this starts it again, also when setup
+/// unwinds from a panic, such as a print to a terminal that has closed.
+struct StoppedAutostart {
+    was_active: bool,
+}
+
+impl StoppedAutostart {
+    fn stop() -> Self {
+        let was_active = autostart_active();
+        if was_active {
+            stop_autostart_service();
+        }
+        Self { was_active }
+    }
+
+    /// `false` when the service ran and does not come back.
+    fn restart(mut self) -> bool {
+        let was_active = std::mem::take(&mut self.was_active);
+        !was_active || start_autostart_service()
+    }
+
+    /// Leaves starting the service to the caller.
+    #[cfg(target_os = "macos")]
+    fn disarm(mut self) {
+        self.was_active = false;
+    }
+}
+
+impl Drop for StoppedAutostart {
+    fn drop(&mut self) {
+        if self.was_active {
+            start_autostart_service();
         }
     }
 }
@@ -688,8 +721,7 @@ fn restart_autostart() -> bool {
 /// config, any other state stays as it is and is reported.
 fn refresh_autostart() -> bool {
     if !autostart_active() {
-        report_autostart_state();
-        return true;
+        return report_autostart_state();
     }
     println!("  Restarting autostart to apply the new config.");
     if !restart_autostart() || !report_service_state() {
@@ -699,8 +731,9 @@ fn refresh_autostart() -> bool {
     true
 }
 
+/// `false` when the state cannot be read.
 #[cfg(target_os = "linux")]
-fn report_autostart_state() {
+fn report_autostart_state() -> bool {
     let loaded = Command::new("systemctl")
         .args([
             "--user",
@@ -721,14 +754,18 @@ fn report_autostart_state() {
         Some(_) => println!(
             "  Autostart is installed but not running. Start it with: systemctl --user start olsvr.service"
         ),
-        None => eprintln!(
-            "  Could not read the service state. Check it with: systemctl --user status olsvr.service"
-        ),
+        None => {
+            eprintln!(
+                "  Could not read the service state. Check it with: systemctl --user status olsvr.service"
+            );
+            return false;
+        }
     }
+    true
 }
 
 #[cfg(target_os = "macos")]
-fn report_autostart_state() {
+fn report_autostart_state() -> bool {
     let plist_path = launchd_plist_path();
     if std::path::Path::new(&plist_path).exists() {
         println!("  The login agent is installed but not loaded, so it starts at the next login.");
@@ -739,6 +776,22 @@ fn report_autostart_state() {
     } else {
         println!("  Autostart is not installed.");
     }
+    true
+}
+
+/// Writes `contents` to a file beside `path` and renames it over `path`, so that a failed write
+/// leaves the old file whole. A symlink at `path`, such as one from a dotfiles manager, stays,
+/// and the file it points to is replaced.
+fn write_replacing(path: &str, contents: &str) -> std::io::Result<()> {
+    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.into());
+    let mut staged = target.clone().into_os_string();
+    staged.push(".new");
+    let written =
+        std::fs::write(&staged, contents).and_then(|()| std::fs::rename(&staged, &target));
+    if written.is_err() {
+        let _ = std::fs::remove_file(&staged);
+    }
+    written
 }
 
 #[cfg(target_os = "linux")]
@@ -836,7 +889,7 @@ fn install_systemd_service(theme: &ColorfulTheme) -> bool {
         crate::EXIT_NO_COMPOSITOR,
         crate::EXIT_ALREADY_RUNNING
     );
-    if let Err(e) = std::fs::write(&service_path, unit) {
+    if let Err(e) = write_replacing(&service_path, &unit) {
         eprintln!("Failed to write service file: {e}");
         return false;
     }
@@ -1058,8 +1111,12 @@ fn install_launchd_agent() -> bool {
 
     // The agent runs from the bundle, so it stops before the bundle changes
     let _interrupts = IgnoreInterrupts::new();
-    let agent_was_loaded = autostart_active();
-    stop_autostart_service();
+    let stopped = StoppedAutostart::stop();
+    if autostart_active() {
+        eprintln!("  The login agent is still loaded, so setup left the app bundle as it was.");
+        eprintln!("  Unload it with: launchctl bootout {}", launchd_target());
+        return false;
+    }
 
     // Launch from the LSUIElement app bundle so the agent has no Dock icon; fall
     // back to the bare installed binary if the bundle couldn't be created.
@@ -1110,16 +1167,15 @@ fn install_launchd_agent() -> bool {
 "#
     );
 
-    if let Err(e) = std::fs::write(&plist_path, plist) {
+    if let Err(e) = write_replacing(&plist_path, &plist) {
         eprintln!("Failed to write launchd plist: {e}");
-        if agent_was_loaded {
-            start_autostart_service();
-        }
         return false;
     }
     println!("  Installed agent to {plist_path}");
 
-    // Reload: bootout any previous instance, then bootstrap into the GUI domain.
+    // Reload: bootout any previous instance, then bootstrap into the GUI domain, whether or not
+    // an agent ran before.
+    stopped.disarm();
     if !restart_autostart() || !report_service_state() {
         return false;
     }
@@ -1145,7 +1201,9 @@ fn report_service_state() -> bool {
 }
 
 /// launchd shows a `pid` line for a job it has started. The PID lock is the second opinion,
-/// which an agent that still runs a build from before the lock does not give.
+/// which an agent that still runs a build from before the lock does not give. Its holder counts
+/// only when launchd, PID 1, is its parent, because an `olsvr run` started by hand holds the lock
+/// too.
 #[cfg(target_os = "macos")]
 fn agent_running() -> bool {
     let printed = Command::new("launchctl")
@@ -1158,5 +1216,19 @@ fn agent_running() -> bool {
                 .is_some_and(|pid| pid.parse::<u32>().is_ok())
         })
     });
-    has_pid || matches!(pidfile::running_pid(&pidfile::path()), Ok(Some(_)))
+    has_pid
+        || matches!(pidfile::running_pid(&pidfile::path()), Ok(Some(pid)) if parent_pid(pid) == Some(1))
+}
+
+/// The parent of process `pid`, or `None` if it cannot be read, e.g. because the process has
+/// exited.
+#[cfg(target_os = "macos")]
+fn parent_pid(pid: libc::pid_t) -> Option<libc::pid_t> {
+    // SAFETY: proc_bsdinfo holds only integers and byte arrays, so all zeros is a valid value.
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    // SAFETY: `info` is writable for the `size` bytes passed.
+    let written =
+        unsafe { libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&raw mut info).cast(), size) };
+    (written == size).then_some(info.pbi_ppid as libc::pid_t)
 }

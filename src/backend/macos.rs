@@ -344,10 +344,11 @@ fn configure_saver_window(window: &Window, monitor: &MonitorHandle) -> Option<Ph
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// While the saver is showing, a system idle time below this means fresh user
-/// input, so dismiss. The borderless accessory windows don't reliably receive
-/// key/mouse events themselves, so the system-wide idle timer is the reliable
-/// dismiss signal. Kept below the Engine's 1s dismiss-grace so a `--now` preview
-/// isn't dismissed by the keystroke that launched it.
+/// input, so dismiss. Only a best-effort fallback: the counter trails input by up
+/// to a second, so its first reading after input is often already above this, and
+/// the windows' own input events are the main dismiss path. Kept below the Engine's
+/// 1s dismiss-grace so a `--now` preview isn't dismissed by the keystroke that
+/// launched it.
 const DISMISS_IDLE_SECS: f64 = 0.5;
 
 /// If an armed watchdog sees no beat for this long, it force-exits to release the
@@ -816,9 +817,8 @@ impl ApplicationHandler for MacApp {
             self.set_locked(session_locked(), event_loop);
         }
 
-        // Drive the Engine from the system-wide idle timer. This is the reliable
-        // dismiss path: the saver windows are borderless and the app is an
-        // accessory, so they don't always get key/mouse events themselves.
+        // Drive the Engine from the system-wide idle timer: activation, and a
+        // best-effort dismiss for input the saver windows did not receive.
         let idle = idle_seconds();
         let showing = !self.targets.is_empty();
         if !showing
@@ -908,8 +908,9 @@ impl ApplicationHandler for MacApp {
             WindowEvent::KeyboardInput { .. }
             | WindowEvent::MouseInput { .. }
             | WindowEvent::CursorMoved { .. } => {
-                // Fast path when the window does receive input; the idle poll in
-                // about_to_wait is the reliable fallback. Keeps the process running.
+                // The main dismiss path (pointer events are known to arrive; key events
+                // are not verified); the idle poll in about_to_wait only backs it up.
+                // Keeps the process running.
                 self.on_event(BackendEvent::DismissInput, event_loop);
             }
             _ => {}

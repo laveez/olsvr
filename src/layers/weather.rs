@@ -11,21 +11,30 @@ use crate::layer::{GpuContext, Layer};
 /// Returns (nerd font icon char, RGB color) for an FMI WeatherSymbol3 code.
 fn weather_icon(code: u8) -> (char, [u8; 3]) {
     match code {
-        1 => ('\u{E30D}', [0xFF, 0xD7, 0x00]),  // day_sunny — yellow
-        2 => ('\u{E302}', [0x87, 0xCE, 0xEB]),  // day_cloudy — light blue
-        3 => ('\u{E312}', [0xA0, 0xA0, 0xA0]),  // cloudy — gray
-        21 => ('\u{E319}', [0x6C, 0xB4, 0xEE]), // showers — light blue
-        22 => ('\u{E318}', [0x4A, 0x90, 0xD9]), // rain — blue
-        23 => ('\u{E318}', [0x2E, 0x5C, 0xA8]), // heavy rain — deep blue
-        31 => ('\u{E31A}', [0xE0, 0xE0, 0xE0]), // light snow — white
-        32 => ('\u{E31A}', [0xFF, 0xFF, 0xFF]), // snow — white
-        33 => ('\u{E35E}', [0xFF, 0xFF, 0xFF]), // snow_wind — bright white
-        41 => ('\u{E3AD}', [0x5F, 0x9E, 0xA0]), // light sleet — teal
-        42 => ('\u{E3AD}', [0x5F, 0x9E, 0xA0]), // sleet — teal
-        43 => ('\u{E3AD}', [0x4A, 0x8A, 0x8C]), // heavy sleet — dark teal
-        51..=53 => ('\u{E309}', [0x4A, 0x90, 0xD9]), // showers — blue
-        61..=64 => ('\u{E31D}', [0x93, 0x70, 0xDB]), // thunderstorm — purple
-        _ => ('\u{E33D}', [0x80, 0x80, 0x80]),  // cloud — gray
+        1 => ('\u{E30D}', [0xFF, 0xD7, 0x00]),  // day_sunny, yellow
+        2 => ('\u{E302}', [0x87, 0xCE, 0xEB]),  // day_cloudy, light blue
+        3 => ('\u{E312}', [0xA0, 0xA0, 0xA0]),  // cloudy, gray
+        21 => ('\u{E319}', [0x6C, 0xB4, 0xEE]), // light showers, light blue
+        22 => ('\u{E319}', [0x4A, 0x90, 0xD9]), // showers, blue
+        23 => ('\u{E319}', [0x2E, 0x5C, 0xA8]), // heavy showers, deep blue
+        31 => ('\u{E318}', [0x6C, 0xB4, 0xEE]), // light rain, light blue
+        32 => ('\u{E318}', [0x4A, 0x90, 0xD9]), // rain, blue
+        33 => ('\u{E318}', [0x2E, 0x5C, 0xA8]), // heavy rain, deep blue
+        41 => ('\u{E31A}', [0xE0, 0xE0, 0xE0]), // light snow showers, white
+        42 => ('\u{E31A}', [0xFF, 0xFF, 0xFF]), // snow showers, white
+        43 => ('\u{E35E}', [0xFF, 0xFF, 0xFF]), // heavy snow showers, snow_wind, bright white
+        51 => ('\u{E31A}', [0xE0, 0xE0, 0xE0]), // light snowfall, white
+        52 => ('\u{E31A}', [0xFF, 0xFF, 0xFF]), // snowfall, white
+        53 => ('\u{E35E}', [0xFF, 0xFF, 0xFF]), // heavy snowfall, snow_wind, bright white
+        61..=64 => ('\u{E31D}', [0x93, 0x70, 0xDB]), // thunderstorm, purple
+        71 => ('\u{E3AD}', [0x5F, 0x9E, 0xA0]), // light sleet showers, teal
+        72 => ('\u{E3AD}', [0x5F, 0x9E, 0xA0]), // sleet showers, teal
+        73 => ('\u{E3AD}', [0x4A, 0x8A, 0x8C]), // heavy sleet showers, dark teal
+        81 => ('\u{E3AD}', [0x5F, 0x9E, 0xA0]), // light sleet, teal
+        82 => ('\u{E3AD}', [0x5F, 0x9E, 0xA0]), // sleet, teal
+        83 => ('\u{E3AD}', [0x4A, 0x8A, 0x8C]), // heavy sleet, dark teal
+        91..=92 => ('\u{E313}', [0xB0, 0xB0, 0xB0]), // mist and fog, light gray
+        _ => ('\u{E33D}', [0x80, 0x80, 0x80]),  // cloud, gray
     }
 }
 
@@ -131,7 +140,8 @@ impl Layer for WeatherLayer {
         {
             let (icon_char, [ir, ig, ib]) = weather_icon(weather.weather_symbol);
             icon_str = icon_char.to_string();
-            temp_str = format!("  {:.0}°C  ", weather.temperature);
+            // -0.4 rounds to -0.0, which prints as "-0"; adding 0.0 turns it into 0.0
+            temp_str = format!("  {:.0}°C  ", weather.temperature.round() + 0.0);
             wind_str = format!("{:.0} m/s", weather.wind_speed);
 
             vec![

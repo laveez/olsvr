@@ -255,6 +255,9 @@ impl Compositor {
 
     pub fn resize(&mut self, width: u32, height: u32) {
         let (width, height) = clamp_to_max(width, height, self.max_texture_dim);
+        if (width, height) == (self.config.width, self.config.height) {
+            return;
+        }
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);

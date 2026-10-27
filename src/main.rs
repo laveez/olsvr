@@ -174,12 +174,28 @@ fn main() {
     }
 }
 
+/// A main-thread panic ends the process at the panic site instead of unwinding: winit catches
+/// it on macOS and leaves the process alive without a saver, and on Linux the unwind drops the
+/// Wayland connection before the swapchain, which can segfault.
+fn exit_on_main_thread_panic() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        default_hook(info);
+        if std::thread::current().name() == Some("main") {
+            let _ = std::fs::remove_file(pid_path());
+            unsafe { libc::_exit(1) }
+        }
+    }));
+}
+
 #[cfg(target_os = "linux")]
 fn run_screensaver(args: RunArgs) {
+    exit_on_main_thread_panic();
     backend::wayland::run(args);
 }
 
 #[cfg(target_os = "macos")]
 fn run_screensaver(args: RunArgs) {
+    exit_on_main_thread_panic();
     backend::macos::run(args);
 }

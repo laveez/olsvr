@@ -15,7 +15,11 @@ use clap::{Parser, Subcommand};
 use crate::config::Config;
 
 #[derive(Parser)]
-#[command(name = "olsvr", about = "OLED screensaver for Wayland and macOS")]
+#[command(
+    name = "olsvr",
+    version,
+    about = "OLED screensaver for Wayland and macOS"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -196,14 +200,23 @@ fn exit_on_main_thread_panic() {
     }));
 }
 
+fn log_version() {
+    let exe = std::env::current_exe()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|e| format!("path unknown: {e}"));
+    log::info!("olsvr {} ({exe})", env!("CARGO_PKG_VERSION"));
+}
+
 #[cfg(target_os = "linux")]
 fn run_screensaver(args: RunArgs) {
     exit_on_main_thread_panic();
+    log_version();
     backend::wayland::run(args);
 }
 
 #[cfg(target_os = "macos")]
 fn run_screensaver(args: RunArgs) {
     exit_on_main_thread_panic();
+    log_version();
     backend::macos::run(args);
 }

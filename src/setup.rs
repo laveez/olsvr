@@ -644,6 +644,10 @@ fn create_app_bundle() -> Option<String> {
   <string>olsvr</string>
   <key>CFBundleExecutable</key>
   <string>olsvr</string>
+  <key>CFBundleShortVersionString</key>
+  <string>{version}</string>
+  <key>CFBundleVersion</key>
+  <string>{version}</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleInfoDictionaryVersion</key>
@@ -656,6 +660,7 @@ fn create_app_bundle() -> Option<String> {
 </plist>
 "#,
         label = crate::LAUNCHD_LABEL,
+        version = env!("CARGO_PKG_VERSION"),
     );
     if let Err(e) = std::fs::write(&info_dst, info) {
         eprintln!("Failed to write app Info.plist: {e}");

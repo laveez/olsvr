@@ -288,8 +288,7 @@ pub fn layer_type(table: &toml::value::Table) -> &str {
 
 const FONT_SIZES: RangeInclusive<i64> = 1..=2000;
 const FONT_SIZE_RULE: &str = "a whole number from 1 to 2000";
-/// Wider than an 8K display (7680 px). From about 2^24, `pad + 1.0 == pad` in f32, and the empty
-/// range panics `Animation::random_position`.
+/// Wider than an 8K display (7680 px).
 const EDGE_PADDINGS: RangeInclusive<i64> = 0..=10000;
 const EDGE_PADDING_RULE: &str = "a whole number from 0 to 10000";
 const TIME_FORMAT_RULE: &str = r#""24h" or "12h""#;

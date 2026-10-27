@@ -2,7 +2,7 @@ use std::fmt::Write;
 use std::sync::{Arc, RwLock};
 
 use glyphon::{
-    Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, TextArea, TextBounds,
+    Attrs, Buffer, Color, Family, FontSystem, Metrics, Shaping, TextArea, TextBounds, Wrap,
     cosmic_text::Align,
 };
 
@@ -27,6 +27,7 @@ pub struct ClockLayer {
     edge_padding: u32,
     x: f32,
     y: f32,
+    block_w: f32,
     current_alpha: u8,
     screen_w: u32,
     screen_h: u32,
@@ -49,6 +50,7 @@ impl Default for ClockLayer {
             edge_padding: 50,
             x: 0.0,
             y: 0.0,
+            block_w: 0.0,
             current_alpha: 0,
             screen_w: 0,
             screen_h: 0,
@@ -67,9 +69,36 @@ fn parse_family(name: &str) -> Family<'_> {
     }
 }
 
+fn format_date(date_format: &str, at: &chrono::DateTime<chrono::Local>) -> String {
+    let mut date = String::new();
+    if write!(date, "{}", at.format(date_format)).is_err() {
+        date = at.format(DEFAULT_DATE_FORMAT).to_string();
+    }
+    date
+}
+
+fn widest_line_w(
+    font_system: &mut FontSystem,
+    family: Family<'_>,
+    font_size: f32,
+    samples: impl IntoIterator<Item = String>,
+) -> f32 {
+    let mut buffer = Buffer::new(font_system, Metrics::new(font_size, font_size * 1.2));
+    let attrs = Attrs::new().family(family);
+    let mut widest = 0.0_f32;
+    for text in samples {
+        buffer.set_text(font_system, &text, &attrs, Shaping::Advanced, None);
+        buffer.shape_until_scroll(font_system, false);
+        for run in buffer.layout_runs() {
+            widest = widest.max(run.line_w);
+        }
+    }
+    widest
+}
+
 impl ClockLayer {
     fn text_block_width(&self) -> f32 {
-        self.font_size * 3.0
+        self.block_w
     }
 
     fn text_block_height(&self) -> f32 {
@@ -126,11 +155,28 @@ impl Layer for ClockLayer {
         self.screen_h = ctx.height;
 
         let fs = self.font_size;
+        let date_fs = fs * 0.3;
         let family = parse_family(&self.font_family);
-        let block_w = fs * 3.0;
+
+        // Sized to the widest text the clock can show, not the current text, so centring,
+        // placement and the weather layer keep one fixed width as the digits change.
+        let meridiems: &[&str] = if self.time_format == "12h" {
+            &[" AM", " PM"]
+        } else {
+            &[""]
+        };
+        let times =
+            ('0'..='9').flat_map(|d| meridiems.iter().map(move |m| format!("{d}{d}:{d}{d}{m}")));
+        let today = chrono::Local::now();
+        let year_of_dates = (0..366)
+            .map(|day| format_date(&self.date_format, &(today + chrono::Duration::days(day))));
+        let time_w = widest_line_w(font_system, family, fs, times);
+        let date_w = widest_line_w(font_system, family, date_fs, year_of_dates);
+        self.block_w = time_w.max(date_w);
 
         let mut time_buffer = Buffer::new(font_system, Metrics::new(fs, fs * 1.2));
-        time_buffer.set_size(font_system, Some(block_w), Some(fs * 1.5));
+        time_buffer.set_wrap(font_system, Wrap::None);
+        time_buffer.set_size(font_system, Some(self.block_w), Some(fs * 1.5));
         time_buffer.set_text(
             font_system,
             "00:00",
@@ -143,9 +189,9 @@ impl Layer for ClockLayer {
         }
         time_buffer.shape_until_scroll(font_system, false);
 
-        let date_fs = fs * 0.3;
         let mut date_buffer = Buffer::new(font_system, Metrics::new(date_fs, date_fs * 1.2));
-        date_buffer.set_size(font_system, Some(block_w), Some(date_fs * 1.5));
+        date_buffer.set_wrap(font_system, Wrap::None);
+        date_buffer.set_size(font_system, Some(self.block_w), Some(date_fs * 1.5));
         date_buffer.set_text(
             font_system,
             "Mon 01 Jan",
@@ -214,10 +260,7 @@ impl Layer for ClockLayer {
             _ => "%H:%M",
         };
         let time_str = now.format(time_fmt).to_string();
-        let mut date_str = String::new();
-        if write!(date_str, "{}", now.format(&self.date_format)).is_err() {
-            date_str = now.format(DEFAULT_DATE_FORMAT).to_string();
-        }
+        let date_str = format_date(&self.date_format, &now);
 
         if let Some(ref mut buf) = self.time_buffer {
             let family = parse_family(&self.font_family);

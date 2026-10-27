@@ -1,4 +1,4 @@
-use rand::RngExt;
+use rand::{Rng, RngExt};
 use std::time::{Duration, Instant};
 
 #[derive(Debug)]
@@ -137,26 +137,43 @@ impl Animation {
         };
         self.last_quadrant = quadrant;
 
-        let half_w = self.screen_width / 2.0;
-        let half_h = self.screen_height / 2.0;
         let pad = self.edge_padding;
+        self.x = random_start(
+            &mut rng,
+            self.screen_width,
+            self.text_width,
+            pad,
+            quadrant % 2 == 1,
+        );
+        self.y = random_start(
+            &mut rng,
+            self.screen_height,
+            self.text_height,
+            pad,
+            quadrant / 2 == 1,
+        );
+    }
+}
 
-        let (x_min, x_max) = match quadrant % 2 {
-            0 => (pad, (half_w - self.text_width - pad).max(pad + 1.0)),
-            _ => (
-                half_w + pad,
-                (self.screen_width - self.text_width - pad).max(half_w + pad + 1.0),
-            ),
-        };
-        let (y_min, y_max) = match quadrant / 2 {
-            0 => (pad, (half_h - self.text_height - pad).max(pad + 1.0)),
-            _ => (
-                half_h + pad,
-                (self.screen_height - self.text_height - pad).max(half_h + pad + 1.0),
-            ),
-        };
-
-        self.x = rng.random_range(x_min..x_max);
-        self.y = rng.random_range(y_min..y_max);
+/// Where a block of `size` starts along an axis of `screen` pixels: anywhere in the chosen half
+/// that keeps `pad` clear of the screen edges and the centre line. A block too big for its half
+/// may start anywhere that keeps `pad` clear of both edges, and one too big for that is centred.
+fn random_start(rng: &mut impl Rng, screen: f32, size: f32, pad: f32, second_half: bool) -> f32 {
+    let half = screen / 2.0;
+    let in_half = if second_half {
+        (half + pad, screen - size - pad)
+    } else {
+        (pad, half - size - pad)
+    };
+    let on_screen = (pad, screen - size - pad);
+    let (min, max) = if in_half.0 < in_half.1 {
+        in_half
+    } else {
+        on_screen
+    };
+    if min < max {
+        rng.random_range(min..max)
+    } else {
+        (screen - size) / 2.0
     }
 }

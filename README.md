@@ -101,10 +101,12 @@ Running `olsvr setup` (or just `olsvr` on first run) starts an interactive wizar
 1. **Timing:** idle timeout, hold duration, fade speed
 2. **Display:** font size, font family, time and date format, brightness, edge padding
 3. **Weather:** on or off, location, update interval, font size, icon font
-4. **Preview:** an optional live preview of your settings; press Enter in the terminal to end it
-5. **Autostart:** optionally install a systemd user service (Linux) or a launchd login agent (macOS) that starts on login
+4. **Preview:** an optional live preview of your settings; press Enter in the terminal to end it. The installed saver pauses while the preview runs and starts again afterwards
+5. **Autostart:** install or refresh a systemd user service (Linux) or a launchd login agent (macOS) that starts on login. Answering No leaves the installed files alone and restarts a running service or agent so that it reads the saved config
 
 Before the autostart step you can change timing, display or weather again, or start over. The wizard writes `~/.olsvr.toml` and can be re-run at any time; its prompts start from the current settings, so Enter keeps them. It rewrites the whole file, so comments in it are lost. If the existing file does not parse, the wizard copies it to `~/.olsvr.toml.bak` and starts from the defaults.
+
+An olsvr that you started yourself, in a terminal or from your compositor's config, is stopped for the preview and not started again. Installing autostart stops it too, and the service or agent takes over.
 
 ---
 
@@ -171,9 +173,10 @@ systemctl --user restart olsvr
 macOS:
 
 ```bash
-olsvr stop
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.laveez.olsvr.plist
+launchctl kickstart -k gui/$(id -u)/io.github.laveez.olsvr
 ```
+
+If you start olsvr from your compositor's config instead, run `olsvr stop` and start it again the way you normally do.
 
 ### General
 
@@ -352,7 +355,7 @@ sudo pacman -S --needed base-devel pkgconf dbus libxkbcommon
 
 **macOS:**
 
-- macOS 11 (Big Sur) or newer, tested on Apple silicon; renders with Metal via wgpu, on the low-power GPU of a Mac that has two (`WGPU_POWER_PREF=high` picks the other)
+- macOS 11 (Big Sur) or newer, tested on Apple silicon; renders with Metal via wgpu, on the low-power GPU of a Mac that has two (`WGPU_POWER_PREF=high` picks the other when you run `olsvr run` in a terminal)
 - Xcode Command Line Tools for the C compiler and linker (`xcode-select --install`)
 
 ---
@@ -374,7 +377,9 @@ olsvr stop
 RUST_LOG=olsvr=debug olsvr run
 ```
 
-**Which build runs.** `olsvr --version` prints the version of the `olsvr` on your `PATH`. The running saver logs `olsvr <version> (<path>)` when it starts. After an upgrade the two differ until the saver restarts: `olsvr setup` restarts it, and on Linux so does the next login. On macOS the agent runs the copy in the app bundle, which only `olsvr setup` replaces; `~/Applications/olsvr.app/Contents/MacOS/olsvr --version` prints its version.
+Afterwards, start the service or agent again with the commands under [Contributing](#contributing).
+
+**Which build runs.** `olsvr --version` prints the version of the `olsvr` on your `PATH`. The running saver logs `olsvr <version> (<path>)` when it starts. After an upgrade the two differ until the saver restarts: `olsvr setup` restarts it, and on Linux so does the next login. On macOS the agent runs the copy in the app bundle, so only `olsvr setup` brings it up to date; `~/Applications/olsvr.app/Contents/MacOS/olsvr --version` prints its version.
 
 **The saver does not show.**
 

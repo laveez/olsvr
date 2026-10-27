@@ -54,8 +54,15 @@ enum FetchError {
 }
 
 fn fetch_fmi_weather(agent: &ureq::Agent, location: &str) -> Result<(f32, u8, f32), FetchError> {
+    // FMI's CDN caches each URL for up to 6 h, so without an explicit window the first step
+    // can be hours old. Asking for the nearest full hour changes the URL every hour.
+    let start = (chrono::Utc::now() + chrono::TimeDelta::minutes(30))
+        .format("%Y-%m-%dT%H:00:00Z")
+        .to_string();
     let mut response = agent
         .get(FMI_URL)
+        .query("starttime", &start)
+        .query("endtime", &start)
         .query("place", location)
         .call()
         .map_err(|e| FetchError::Failed(format!("HTTP request failed: {e}")))?;

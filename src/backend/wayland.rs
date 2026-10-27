@@ -257,29 +257,29 @@ fn idle_inhibited_by_others(
     }
 }
 
-/// Keeps `locked` equal to GNOME's lock screen state. The match callback runs inside
-/// `Connection::process`.
-fn watch_lock_screen(conn: &dbus::blocking::Connection, locked: &Arc<AtomicBool>) {
-    let flag = Arc::clone(locked);
-    let watch = conn.add_match(
+/// Keeps `locked` equal to GNOME's lock screen state and sets `heard` at each change. The match
+/// callback runs inside `Connection::process`.
+fn watch_lock_screen(
+    conn: &dbus::blocking::Connection,
+    locked: &Arc<AtomicBool>,
+    heard: &Arc<AtomicBool>,
+) -> Result<(), dbus::Error> {
+    let (flag, heard) = (Arc::clone(locked), Arc::clone(heard));
+    conn.add_match(
         MatchRule::new_signal("org.gnome.ScreenSaver", "ActiveChanged"),
         move |(active,): (bool,), _: &dbus::blocking::Connection, _: &dbus::Message| {
             flag.store(active, Ordering::Relaxed);
+            heard.store(true, Ordering::Relaxed);
             true
         },
-    );
-    if let Err(e) = watch {
-        log::warn!("D-Bus: cannot watch the GNOME lock screen: {e}");
-    }
+    )?;
+    Ok(())
 }
 
-/// Stores GNOME's lock screen state into `locked`. Only a missing reply is returned, because
-/// then a lock screen service exists but did not answer, as when gnome-shell stalls. Any other
-/// failure counts as unlocked, as on desktops without GNOME's lock screen.
-fn read_lock_screen(
-    conn: &dbus::blocking::Connection,
-    locked: &AtomicBool,
-) -> Result<(), dbus::Error> {
+/// GNOME's lock screen state. Only a missing reply is an error, because then a lock screen
+/// service exists but did not answer, as when gnome-shell stalls. Any other failure counts as
+/// unlocked, as on desktops without GNOME's lock screen.
+fn read_lock_screen(conn: &dbus::blocking::Connection) -> Result<bool, dbus::Error> {
     let screensaver = conn.with_proxy(
         "org.gnome.ScreenSaver",
         "/org/gnome/ScreenSaver",
@@ -288,16 +288,13 @@ fn read_lock_screen(
     let active: Result<(bool,), dbus::Error> =
         screensaver.method_call("org.gnome.ScreenSaver", "GetActive", ());
     match active {
-        Ok((active,)) => locked.store(active, Ordering::Relaxed),
+        Ok((active,)) => Ok(active),
+        Err(e) if is_no_reply(&e) => Err(e),
         Err(e) => {
-            locked.store(false, Ordering::Relaxed);
-            if is_no_reply(&e) {
-                return Err(e);
-            }
             log::warn!("D-Bus: GetActive failed, assuming unlocked: {e}");
+            Ok(false)
         }
     }
-    Ok(())
 }
 
 /// Why the monitor stops using its connection.
@@ -317,9 +314,12 @@ struct IdleMonitor {
     timeout_ms: u64,
     hold: KeepAwakeHold,
     /// GetActive retries left after the read at connect got no reply, one per tick in which
-    /// GetIdletime answers. While any are left the session may be locked, so the monitor
-    /// neither activates nor takes the hold; after the last one it assumes unlocked.
+    /// GetIdletime answers, until GetActive or an ActiveChanged answers. While any are left the
+    /// session may be locked, so the monitor neither activates nor takes the hold; after the
+    /// last one it assumes unlocked.
     lock_retries: u32,
+    /// Set by each ActiveChanged on the current connection.
+    lock_heard: Arc<AtomicBool>,
     was_locked: bool,
     was_idle: bool,
     /// One timeout after a hide without input; no activation before it.
@@ -337,31 +337,41 @@ impl Drop for IdleMonitor {
 }
 
 impl IdleMonitor {
-    /// Retries until the session bus accepts a connection.
+    /// Retries until the session bus accepts a connection and the lock screen watch.
     fn connect(&mut self) -> dbus::blocking::Connection {
         loop {
-            match dbus::blocking::Connection::new_session() {
-                Ok(conn) => {
-                    watch_lock_screen(&conn, &self.locked);
-                    self.lock_retries = match read_lock_screen(&conn, &self.locked) {
-                        Ok(()) => 0,
-                        Err(e) => {
-                            log::warn!(
-                                "D-Bus: GetActive got no reply, so activation waits for a retry: {e}"
-                            );
-                            LOCK_READ_RETRIES
-                        }
-                    };
-                    self.hold.forget_connection();
-                    return conn;
-                }
-                Err(e) => {
-                    self.locked.store(false, Ordering::Relaxed);
-                    self.record_failure("cannot connect to the session bus", &e);
-                    std::thread::sleep(self.next_poll.saturating_duration_since(Instant::now()));
-                }
-            }
+            let (what, e) = match self.try_connect() {
+                Ok(conn) => return conn,
+                Err(failure) => failure,
+            };
+            self.locked.store(false, Ordering::Relaxed);
+            self.record_failure(what, &e);
+            std::thread::sleep(self.next_poll.saturating_duration_since(Instant::now()));
         }
+    }
+
+    fn try_connect(&mut self) -> Result<dbus::blocking::Connection, (&'static str, dbus::Error)> {
+        let conn = dbus::blocking::Connection::new_session()
+            .map_err(|e| ("cannot connect to the session bus", e))?;
+        self.lock_heard.store(false, Ordering::Relaxed);
+        watch_lock_screen(&conn, &self.locked, &self.lock_heard)
+            .map_err(|e| ("cannot watch the GNOME lock screen", e))?;
+        // A reconnect must not keep a stale true, so a read that got no reply stores false and
+        // leaves the state to the retries or the next ActiveChanged.
+        let active = match read_lock_screen(&conn) {
+            Ok(active) => {
+                self.lock_retries = 0;
+                active
+            }
+            Err(e) => {
+                log::warn!("D-Bus: GetActive got no reply, so activation waits for a retry: {e}");
+                self.lock_retries = LOCK_READ_RETRIES;
+                false
+            }
+        };
+        self.locked.store(active, Ordering::Relaxed);
+        self.hold.forget_connection();
+        Ok(conn)
     }
 
     fn tick(&mut self, conn: &dbus::blocking::Connection) -> Result<(), Exit> {
@@ -378,6 +388,9 @@ impl IdleMonitor {
                     return Err(Exit::Reconnect);
                 }
             }
+        }
+        if self.lock_heard.load(Ordering::Relaxed) {
+            self.lock_retries = 0;
         }
 
         while let Ok(command) = self.commands.try_recv() {
@@ -433,8 +446,11 @@ impl IdleMonitor {
         }
 
         if self.lock_retries > 0 {
-            match read_lock_screen(conn, &self.locked) {
-                Ok(()) => self.lock_retries = 0,
+            match read_lock_screen(conn) {
+                Ok(active) => {
+                    self.locked.store(active, Ordering::Relaxed);
+                    self.lock_retries = 0;
+                }
                 Err(e) => {
                     self.lock_retries -= 1;
                     if self.lock_retries > 0 {
@@ -527,6 +543,7 @@ fn dbus_idle_monitor_loop(
         timeout_ms,
         hold: KeepAwakeHold::default(),
         lock_retries: 0,
+        lock_heard: Arc::new(AtomicBool::new(false)),
         was_locked: false,
         was_idle: false,
         activate_after: None,

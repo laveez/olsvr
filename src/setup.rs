@@ -785,7 +785,7 @@ fn report_autostart_state() -> bool {
 /// failed write leaves the old file whole. A symlink at `path`, such as one from a dotfiles
 /// manager, stays, and the file it points to is replaced or created.
 fn write_replacing(path: &str, contents: &str) -> std::io::Result<()> {
-    let target = link_target(Path::new(path));
+    let target = link_target(Path::new(path))?;
     let mut staged = target.clone().into_os_string();
     // Named after this process, so that two setups at once never write into the same file
     staged.push(format!(".{}.new", std::process::id()));
@@ -803,17 +803,17 @@ fn write_replacing(path: &str, contents: &str) -> std::io::Result<()> {
 }
 
 /// The file a write to `path` lands in: where the symlinks at `path` lead, even when that file
-/// does not exist yet, or `path` itself.
-fn link_target(path: &Path) -> PathBuf {
+/// does not exist yet, or `path` itself. Fails on a symlink cycle, as a direct write would.
+fn link_target(path: &Path) -> std::io::Result<PathBuf> {
     let mut target = path.to_path_buf();
     // Linux's own limit on symlinks followed in one lookup
     for _ in 0..40 {
         let Ok(link) = std::fs::read_link(&target) else {
-            break;
+            return Ok(target);
         };
         target = target.parent().map_or(link.clone(), |dir| dir.join(&link));
     }
-    target
+    Err(std::io::Error::from_raw_os_error(libc::ELOOP))
 }
 
 #[cfg(target_os = "linux")]

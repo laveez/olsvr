@@ -95,12 +95,12 @@ struct GnomeSession {
 }
 
 impl GnomeSession {
-    fn spawn(events: Sender<DbusIdleEvent>, timeout_ms: u64) -> Self {
+    fn spawn(events: Sender<DbusIdleEvent>, timeout_ms: u64, poll_idle: bool) -> Self {
         let (tx, commands) = mpsc::channel();
         let locked = Arc::new(AtomicBool::new(false));
         let thread_locked = Arc::clone(&locked);
         std::thread::spawn(move || {
-            dbus_idle_monitor_loop(events, commands, thread_locked, timeout_ms)
+            dbus_idle_monitor_loop(events, commands, thread_locked, timeout_ms, poll_idle)
         });
         Self { tx, locked }
     }
@@ -222,6 +222,26 @@ fn get_mutter_idletime(conn: &dbus::blocking::Connection) -> Result<u64, dbus::E
     Ok(ms)
 }
 
+/// Whether gnome-session owns its name on the session bus. GNOME Shell's unit starts only once
+/// the session manager's is up (`After=gnome-session-manager.target`), so on GNOME the name is
+/// owned by the time olsvr has connected to the compositor, and one check is enough.
+fn gnome_session_running() -> bool {
+    let Ok(conn) = dbus::blocking::Connection::new_session() else {
+        return false;
+    };
+    let bus = conn.with_proxy(
+        "org.freedesktop.DBus",
+        "/org/freedesktop/DBus",
+        CALL_TIMEOUT,
+    );
+    let owned: Result<(bool,), dbus::Error> = bus.method_call(
+        "org.freedesktop.DBus",
+        "NameHasOwner",
+        ("org.gnome.SessionManager",),
+    );
+    owned.is_ok_and(|(owned,)| owned)
+}
+
 /// Whether an app other than olsvr holds a gnome-session idle inhibitor. Inhibitors relayed by
 /// mutter count: mpv and SDL inhibit through that relay, and olsvr's own relayed inhibitor exists
 /// only while the saver shows, when activation is moot. No session manager on the bus counts as
@@ -313,6 +333,9 @@ struct IdleMonitor {
     /// true cannot refuse activations for good.
     locked: Arc<AtomicBool>,
     timeout_ms: u64,
+    /// False while ext-idle-notify reports idle; the monitor then only tracks the lock screen
+    /// and the `always` hold.
+    poll_idle: bool,
     hold: KeepAwakeHold,
     /// GetActive retries left after the read at connect got no reply, one per tick in which
     /// GetIdletime answers, until GetActive or an ActiveChanged answers. While any are left the
@@ -428,7 +451,11 @@ impl IdleMonitor {
         if Instant::now() < self.next_poll {
             return Ok(());
         }
-        let idle_ms = match get_mutter_idletime(conn) {
+        let idle_ms = match self
+            .poll_idle
+            .then(|| get_mutter_idletime(conn))
+            .transpose()
+        {
             Ok(ms) => ms,
             Err(e) => {
                 self.record_failure("GetIdletime failed", &e);
@@ -439,8 +466,13 @@ impl IdleMonitor {
             }
         };
         if self.failures > 0 {
+            let source = if self.poll_idle {
+                "GetIdletime"
+            } else {
+                "the session bus"
+            };
             log::info!(
-                "D-Bus: GetIdletime works again after {} failures",
+                "D-Bus: {source} works again after {} failures",
                 self.failures
             );
             self.failures = 0;
@@ -465,6 +497,9 @@ impl IdleMonitor {
         if self.locked.load(Ordering::Relaxed) {
             return Ok(());
         }
+        let Some(idle_ms) = idle_ms else {
+            return Ok(());
+        };
         if !self.was_idle && idle_ms >= self.timeout_ms && self.activation_allowed(&session) {
             log::info!("D-Bus: user idle ({idle_ms}ms) — activating screensaver");
             self.send(DbusIdleEvent::Idle)?;
@@ -511,13 +546,18 @@ impl IdleMonitor {
         let delay = retry_delay(self.failures);
         self.next_poll = Instant::now() + delay;
         let (n, secs) = (self.failures, delay.as_secs());
+        let lost = if self.poll_idle {
+            "no idle source works"
+        } else {
+            "the GNOME lock screen goes unwatched"
+        };
         match n {
             1 => log::warn!("D-Bus: {what}, retrying in {secs}s: {e}"),
             n if n < RECONNECT_AFTER => {
                 log::info!("D-Bus: {what} ({n} failures in a row), retrying in {secs}s: {e}")
             }
             RECONNECT_AFTER => log::error!(
-                "D-Bus: {what} ({n} failures in a row), so no idle source works; reconnecting, then retrying in {secs}s: {e}"
+                "D-Bus: {what} ({n} failures in a row), so {lost}; reconnecting, then retrying in {secs}s: {e}"
             ),
             _ => log::debug!("D-Bus: {what} ({n} failures in a row), retrying in {secs}s: {e}"),
         }
@@ -536,12 +576,14 @@ fn dbus_idle_monitor_loop(
     commands: mpsc::Receiver<GnomeCommand>,
     locked: Arc<AtomicBool>,
     timeout_ms: u64,
+    poll_idle: bool,
 ) {
     let mut monitor = IdleMonitor {
         events,
         commands,
         locked,
         timeout_ms,
+        poll_idle,
         hold: KeepAwakeHold::default(),
         lock_retries: 0,
         lock_heard: Arc::new(AtomicBool::new(false)),
@@ -662,11 +704,37 @@ impl App {
         for cmd in cmds {
             match cmd {
                 EngineCommand::Show { .. } => self.activate(qh),
-                EngineCommand::Hide => self.deactivate(),
+                EngineCommand::Hide => {
+                    self.deactivate();
+                    self.arm_idle_notification(qh);
+                }
                 EngineCommand::SetKeepAwake(on) => self.set_keep_awake(on),
                 EngineCommand::Quit => self.running = false,
             }
         }
+    }
+
+    /// Replaces the ext-idle notification with a new one on the current seat, which starts out
+    /// not idle with its timer running. KWin keeps a notification idle through olsvr's own
+    /// inhibitor, so after a dismiss the old one would report no idle period until new input
+    /// had resumed it.
+    fn arm_idle_notification(&mut self, qh: &QueueHandle<Self>) {
+        if let Some(notification) = self.idle_notification.take() {
+            notification.destroy();
+        }
+        let Some(notifier) = &self.idle_notifier else {
+            return;
+        };
+        let Some(seat) = &self.seat else {
+            log::error!(
+                "ext_idle_notifier_v1 is available but has no seat to watch, so it reports no idle time"
+            );
+            return;
+        };
+        let timeout_ms = u32::try_from(u64::from(self.config.timeout).saturating_mul(60_000))
+            .unwrap_or(u32::MAX);
+        log::info!("Setting up Wayland idle notification: {timeout_ms}ms");
+        self.idle_notification = Some(notifier.get_idle_notification(timeout_ms, seat, qh, ()));
     }
 
     /// Only `always` reaches GNOME. Under `while-active` the saver surface's zwp inhibitor is
@@ -843,9 +911,10 @@ impl SeatHandler for App {
         &mut self.seat_state
     }
 
-    fn new_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+    fn new_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
         if self.seat.is_none() {
             self.seat = Some(seat);
+            self.arm_idle_notification(qh);
         }
     }
 
@@ -891,7 +960,13 @@ impl SeatHandler for App {
         }
     }
 
-    fn remove_seat(&mut self, _conn: &Connection, _qh: &QueueHandle<Self>, _seat: wl_seat::WlSeat) {
+    fn remove_seat(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, seat: wl_seat::WlSeat) {
+        if self.seat.as_ref() != Some(&seat) {
+            return;
+        }
+        // SCTK still lists the removed seat while this runs.
+        self.seat = self.seat_state.seats().find(|other| *other != seat);
+        self.arm_idle_notification(qh);
     }
 }
 
@@ -1054,11 +1129,30 @@ impl Dispatch<ExtIdleNotificationV1, ()> for App {
     ) {
         match event {
             ext_idle_notification_v1::Event::Idled => {
+                if state.gnome.as_ref().is_some_and(GnomeSession::locked) {
+                    log::info!("Session locked, not activating");
+                    // This notification stays idle until input, which an unlock by fingerprint
+                    // does not give; a new one asks again one timeout later.
+                    state.arm_idle_notification(qh);
+                    return;
+                }
                 log::info!("User idle — activating screensaver");
                 state.on_event(BackendEvent::Idle, qh);
             }
             ext_idle_notification_v1::Event::Resumed => {
-                log::info!("User resumed — deactivating screensaver");
+                // wlroots and Hyprland send one when olsvr's own inhibitor takes effect, and
+                // report no input while it holds, so the saver's input handlers dismiss it.
+                if state
+                    .screensaver
+                    .as_ref()
+                    .is_some_and(|ss| ss.inhibitor.is_some())
+                {
+                    log::info!(
+                        "Idle notification resumed under the saver's own inhibitor, ignored"
+                    );
+                    return;
+                }
+                log::info!("User resumed");
                 state.on_event(BackendEvent::Resume, qh);
             }
             _ => {}
@@ -1282,31 +1376,33 @@ pub fn run(args: RunArgs) {
 
     dispatch_or_exit(&mut event_loop, Duration::from_millis(100), &mut app);
 
-    if let (Some(notifier), Some(seat)) = (&app.idle_notifier, &app.seat) {
-        let timeout_ms =
-            u32::try_from(u64::from(app.config.timeout).saturating_mul(60_000)).unwrap_or(u32::MAX);
-        log::info!("Setting up Wayland idle notification: {}ms", timeout_ms);
-        let notification = notifier.get_idle_notification(timeout_ms, seat, &qh, ());
-        app.idle_notification = Some(notification);
-    } else {
-        if app.idle_notifier.is_some() {
-            log::error!(
-                "ext_idle_notifier_v1 is available but has no seat to watch, so idle detection falls back to the GNOME D-Bus monitor"
-            );
-        }
-        // Started without a probe: mutter claims its D-Bus name asynchronously, and the monitor
-        // retries until it answers.
+    // SCTK calls `new_seat` only for seats announced after the registry's first roundtrip.
+    if app.seat.is_none() {
+        app.seat = app.seat_state.seats().next();
+    }
+    app.arm_idle_notification(&qh);
+
+    // The D-Bus monitor polls GNOME's idle time only while ext-idle-notify is not armed, and then
+    // starts without a probe: mutter claims its D-Bus name asynchronously, and the monitor retries
+    // until it answers. Beside ext-idle it runs only on GNOME, for the lock screen and
+    // keep_awake = "always".
+    let poll_idle = app.idle_notification.is_none();
+    if poll_idle || gnome_session_running() {
         let timeout_ms = app.config.timeout as u64 * 60 * 1000;
-        log::info!("Using D-Bus Mutter IdleMonitor fallback: {}ms", timeout_ms);
+        let stopped = if poll_idle {
+            log::info!("Using D-Bus Mutter IdleMonitor fallback: {}ms", timeout_ms);
+            "the saver no longer activates on idle"
+        } else {
+            log::info!("GNOME session found, watching its lock screen over D-Bus");
+            "the GNOME lock screen goes unwatched"
+        };
         let (tx, rx) = channel::channel::<DbusIdleEvent>();
-        app.gnome = Some(GnomeSession::spawn(tx, timeout_ms));
+        app.gnome = Some(GnomeSession::spawn(tx, timeout_ms, poll_idle));
         event_loop
             .handle()
-            .insert_source(rx, |event, _, app: &mut App| {
+            .insert_source(rx, move |event, _, app: &mut App| {
                 let channel::Event::Msg(msg) = event else {
-                    log::error!(
-                        "D-Bus monitor has stopped, so the saver no longer activates on idle"
-                    );
+                    log::error!("D-Bus monitor has stopped, so {stopped}");
                     return;
                 };
                 match msg {
@@ -1323,7 +1419,7 @@ pub fn run(args: RunArgs) {
     }
 
     // Apply any startup commands (e.g. hold keep-awake under the "always" policy). This comes
-    // after the D-Bus fallback above, which `always` needs on GNOME.
+    // after the D-Bus monitor above, which `always` needs on GNOME.
     let init_cmds = app.engine.init();
     app.apply(init_cmds, &qh);
 

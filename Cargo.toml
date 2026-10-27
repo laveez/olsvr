@@ -32,7 +32,7 @@ env_logger = "0.11"
 # builds on macOS. The macOS backend uses winit/Cocoa; see the macos target
 # section below.
 [target.'cfg(target_os = "linux")'.dependencies]
-smithay-client-toolkit = "0.20"
+smithay-client-toolkit = "0.21"
 wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-protocols = { version = "0.32", features = ["client", "staging"] }

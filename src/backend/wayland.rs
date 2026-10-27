@@ -10,9 +10,8 @@ use std::time::{Duration, Instant};
 
 use dbus::message::MatchRule;
 use smithay_client_toolkit::{
-    compositor::{CompositorHandler, CompositorState},
-    delegate_compositor, delegate_keyboard, delegate_output, delegate_pointer, delegate_registry,
-    delegate_seat, delegate_xdg_shell, delegate_xdg_window,
+    compositor::{CompositorHandler, CompositorState, FrameCallbackData},
+    delegate_dispatch2, delegate_registry,
     output::{OutputHandler, OutputState},
     reexports::calloop::{
         EventLoop,
@@ -877,7 +876,7 @@ impl App {
         if request {
             // Double-buffered like the rest of the surface state, so the commit inside the
             // present carries it.
-            surface.frame(qh, surface.clone());
+            surface.frame(qh, FrameCallbackData(surface.clone()));
         }
         let outcome = comp.render_frame(debug_info.as_ref());
         if outcome == FrameOutcome::Presented {
@@ -1300,14 +1299,8 @@ impl ProvidesRegistryState for App {
     registry_handlers!(OutputState, SeatState);
 }
 
-delegate_compositor!(App);
-delegate_keyboard!(App);
-delegate_output!(App);
-delegate_pointer!(App);
+delegate_dispatch2!(App);
 delegate_registry!(App);
-delegate_seat!(App);
-delegate_xdg_shell!(App);
-delegate_xdg_window!(App);
 
 fn vulkan_instance() -> wgpu::Instance {
     wgpu::Instance::new(wgpu::InstanceDescriptor {

@@ -25,11 +25,11 @@ use winit::monitor::MonitorHandle;
 use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS, MonitorHandleExtMacOS};
 use winit::window::{Window, WindowId, WindowLevel};
 
-use crate::RunArgs;
 use crate::compositor::{Compositor, FrameOutcome};
 use crate::config::{Config, DisplayScope};
 use crate::data::{self, DataCache};
 use crate::engine::{BackendEvent, Engine, EngineCommand};
+use crate::{RunArgs, pidfile};
 
 // ---- FFI: idle time (CoreGraphics) + display-sleep assertion (IOKit) ----
 
@@ -175,7 +175,7 @@ unsafe fn is_display_sleep_assertion(assertion: *const c_void) -> bool {
 /// process has exited. `proc_name` returns the length of the name it copied, or 0 on
 /// failure, and fails unless the buffer can hold `pbi_name` of libproc's
 /// `struct proc_bsdinfo`, `2 * MAXCOMLEN` bytes.
-fn process_name(pid: i32) -> String {
+pub(crate) fn process_name(pid: i32) -> String {
     let mut buffer = [0u8; 2 * libc::MAXCOMLEN];
     // SAFETY: `buffer` is writable for the `buffer.len()` bytes passed, and proc_name never
     // writes more than it is given.
@@ -413,7 +413,7 @@ impl Watchdog {
                     log::error!(
                         "watchdog: render stalled {since_beat}ms while active — exiting to release the display (launchd will restart)"
                     );
-                    let _ = std::fs::remove_file(crate::pid_path());
+                    pidfile::remove_if_ours(&pidfile::path());
                     // exit() can hang in atexit and framework handlers with the main thread wedged.
                     unsafe { libc::_exit(1) }
                 }
@@ -427,15 +427,30 @@ pub fn run(args: RunArgs) {
         eprintln!("--activate is not supported on macOS; the screensaver activates on idle.");
         return;
     }
+    // A preview beside the running instance would be a second saver, and that instance has
+    // no SIGUSR1 handler, so the signal Linux sends would kill it.
+    if args.now {
+        match pidfile::running_pid(&pidfile::path()) {
+            Ok(None) => {}
+            Ok(Some(pid)) => {
+                eprintln!("olsvr is already running (PID {pid}); stop it to preview");
+                std::process::exit(crate::EXIT_ALREADY_RUNNING);
+            }
+            Err(e) => {
+                eprintln!("Cannot check for a running olsvr instance: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
 
     let mut config = Config::load();
     crate::merge_cli(&mut config, &args);
 
-    // Record our PID so `olsvr stop` and the setup wizard can find this instance.
-    let pid_file = crate::pid_path();
-    if let Err(e) = std::fs::write(&pid_file, std::process::id().to_string()) {
-        log::warn!("Failed to write PID file {}: {e}", pid_file.display());
-    }
+    let _pid_lock = if args.now {
+        None
+    } else {
+        pidfile::lock_or_exit()
+    };
 
     let timeout = Duration::from_secs(config.timeout as u64 * 60);
     let engine = Engine::new(config.activation, vec![0]);
@@ -466,7 +481,7 @@ pub fn run(args: RunArgs) {
         timeout,
         weather_started: false,
         started: false,
-        show_now: args.now,
+        preview: args.now,
         debug: args.debug,
         cursor_hidden: false,
         watchdog,
@@ -504,7 +519,8 @@ struct MacApp {
     timeout: Duration,
     weather_started: bool,
     started: bool,
-    show_now: bool,
+    /// `run --now`: shows at startup and exits at the first hide, without a PID file.
+    preview: bool,
     debug: bool,
     cursor_hidden: bool,
     watchdog: Arc<Watchdog>,
@@ -770,7 +786,6 @@ impl Drop for MacApp {
         if self.cursor_hidden {
             show_cursor();
         }
-        let _ = std::fs::remove_file(crate::pid_path());
     }
 }
 
@@ -785,7 +800,7 @@ impl ApplicationHandler for MacApp {
         // Startup commands (holds keep-awake under the "always" policy).
         let cmds = self.engine.init();
         self.apply(cmds, event_loop);
-        if self.show_now {
+        if self.preview {
             if self.locked {
                 log::info!("Session locked, not activating");
             } else {
@@ -838,6 +853,10 @@ impl ApplicationHandler for MacApp {
         // beat here. A visible window still has to complete its frames.
         if !self.targets.is_empty() && self.targets.iter().all(|t| t.occluded) {
             self.watchdog.beat();
+        }
+        // A preview ends with its first hide, or at once when it could not show.
+        if self.preview && self.targets.is_empty() {
+            event_loop.exit();
         }
         event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + POLL_INTERVAL));
     }

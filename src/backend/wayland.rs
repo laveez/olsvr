@@ -1,6 +1,7 @@
 //! Wayland (Linux) backend, extracted from the original `main.rs` and driven through
-//! the `Engine`. The shared CLI and helpers (`Cli`, `RunArgs`, `pid_path`, `merge_cli`,
-//! `stop`, `main`) live in the crate root (`src/main.rs`). Compiled only on Linux.
+//! the `Engine`. The shared CLI and helpers (`Cli`, `RunArgs`, `merge_cli`, `stop`, `main`)
+//! live in the crate root (`src/main.rs`), the PID file in `src/pidfile.rs`. Compiled only on
+//! Linux.
 
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -50,7 +51,7 @@ use crate::compositor::{Compositor, DebugInfo, FrameOutcome, warning_due};
 use crate::config::{Config, KeepAwake};
 use crate::data::{self, DataCache};
 use crate::engine::{BackendEvent, Engine, EngineCommand};
-use crate::{RunArgs, merge_cli, pid_path};
+use crate::{EXIT_NO_COMPOSITOR, RunArgs, merge_cli, pidfile};
 
 enum DbusIdleEvent {
     Idle,
@@ -1125,17 +1126,13 @@ fn vulkan_instance() -> wgpu::Instance {
     })
 }
 
-/// Exit status when there is no compositor to connect to. It is distinct from a crash's 1, so
-/// the systemd unit can be set not to restart on it.
-const EXIT_NO_COMPOSITOR: i32 = 3;
-
 /// A dispatch error means the compositor connection is gone: a logout, a compositor crash, or
 /// the compositor dropping olsvr. The process exits without dropping anything, since the
 /// swapchain's teardown would run against the dead connection.
 fn dispatch_or_exit(event_loop: &mut EventLoop<'_, App>, timeout: Duration, app: &mut App) {
     if let Err(e) = event_loop.dispatch(timeout, app) {
         log::error!("Event loop dispatch failed, exiting: {e}");
-        let _ = std::fs::remove_file(pid_path());
+        pidfile::remove_if_ours(&pidfile::path());
         unsafe { libc::_exit(1) }
     }
 }
@@ -1151,33 +1148,44 @@ pub fn run(args: RunArgs) {
 
     // --activate: send SIGUSR1 to running instance and exit
     if args.activate {
-        let path = pid_path();
-        if let Ok(contents) = std::fs::read_to_string(&path)
-            && let Ok(pid) = contents.trim().parse::<i32>()
-        {
-            log::info!("Sending SIGUSR1 to PID {pid}");
-            unsafe { libc::kill(pid, libc::SIGUSR1) };
-            return;
+        match pidfile::signal_running(libc::SIGUSR1) {
+            Ok(Some(pid)) => log::info!("Sent SIGUSR1 to PID {pid}"),
+            Ok(None) => {
+                eprintln!("No running olsvr instance found");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Cannot signal the running olsvr instance: {e}");
+                std::process::exit(1);
+            }
         }
-        eprintln!(
-            "No running olsvr instance found (no PID file at {})",
-            path.display()
-        );
-        std::process::exit(1);
+        return;
+    }
+    // A preview beside the running instance would be a second saver, so that instance shows.
+    let preview = args.now;
+    if preview {
+        match pidfile::signal_running(libc::SIGUSR1) {
+            Ok(None) => {}
+            Ok(Some(pid)) => {
+                log::info!(
+                    "olsvr is already running (PID {pid}), activated it instead of a preview"
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("Cannot signal the running olsvr instance: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let mut config = Config::load();
     merge_cli(&mut config, &args);
 
-    // Write PID file
-    let path = pid_path();
-    std::fs::write(&path, std::process::id().to_string()).expect("Failed to write PID file");
-
     let conn = match Connection::connect_to_env() {
         Ok(conn) => conn,
         Err(e) => {
             log::error!("Cannot connect to the Wayland compositor: {e}");
-            let _ = std::fs::remove_file(&path);
             std::process::exit(EXIT_NO_COMPOSITOR);
         }
     };
@@ -1211,6 +1219,14 @@ pub fn run(args: RunArgs) {
     let signals = Signals::new(&[Signal::SIGUSR1, Signal::SIGTERM, Signal::SIGINT])
         .expect("Failed to create signal source");
 
+    // Only now that SIGUSR1 is blocked: an `--activate` that found the PID earlier would kill
+    // this process.
+    let _pid_lock = if preview {
+        None
+    } else {
+        pidfile::lock_or_exit()
+    };
+
     let mut app = App {
         gpu_instance: Some(vulkan_instance()),
         registry_state: RegistryState::new(&globals),
@@ -1233,7 +1249,7 @@ pub fn run(args: RunArgs) {
         width: 0,
         height: 0,
         running: true,
-        signal_activate: args.now,
+        signal_activate: preview,
         signal_deactivate: false,
         signal_locked: false,
         ready_to_draw: false,
@@ -1346,6 +1362,10 @@ pub fn run(args: RunArgs) {
             // go so that gsd-power can blank the locked panel.
             app.on_event(BackendEvent::SurfaceClosed, &qh);
         }
+        // A preview ends with its first hide, or at once when it could not show.
+        if preview && app.screensaver.is_none() {
+            break;
+        }
 
         // Draw when the compositor signals readiness (frame callback), or
         // after 100ms as a fallback if the callback chain breaks.
@@ -1393,9 +1413,11 @@ pub fn run(args: RunArgs) {
             log::warn!("Dispatch blocked {dispatch_ms}ms (no draw)");
         }
     }
-
-    let _ = std::fs::remove_file(pid_path());
+    // `_pid_lock` outlives the event loop, whose signal source unblocks SIGUSR1 as it drops,
+    // so an `--activate` during the teardown would kill the process. SIG_IGN also discards a
+    // SIGUSR1 that is already pending.
+    unsafe { libc::signal(libc::SIGUSR1, libc::SIG_IGN) };
 }
 
-// `main`, `stop`, the CLI types, `pid_path`, and `merge_cli` now live in the
-// crate root (`src/main.rs`). This module exposes `pub fn run` as the backend.
+// `main`, `stop`, the CLI types and `merge_cli` now live in the crate root
+// (`src/main.rs`). This module exposes `pub fn run` as the backend.

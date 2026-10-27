@@ -6,13 +6,13 @@ mod data;
 mod engine;
 mod layer;
 mod layers;
+mod pidfile;
 mod setup;
-
-use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
 use crate::config::Config;
+use crate::pidfile::StopOutcome;
 
 #[derive(Parser)]
 #[command(
@@ -45,7 +45,8 @@ pub(crate) struct RunArgs {
     #[arg(long)]
     pub activate: bool,
 
-    /// Start and immediately show the screensaver (skip idle wait)
+    /// Show the screensaver now: a preview that ends at the first input, or on Linux the
+    /// running instance's saver
     #[arg(long)]
     pub now: bool,
 
@@ -74,17 +75,14 @@ pub(crate) struct RunArgs {
 #[cfg(target_os = "macos")]
 pub(crate) const LAUNCHD_LABEL: &str = "io.github.laveez.olsvr";
 
+/// Exit status when there is no compositor to connect to. It differs from the 1 of a failure,
+/// so the autostart unit can leave a start without a session alone (`RestartPreventExitStatus`).
 #[cfg(target_os = "linux")]
-pub(crate) fn pid_path() -> PathBuf {
-    let uid = unsafe { libc::getuid() };
-    PathBuf::from(format!("/run/user/{uid}/olsvr.pid"))
-}
+pub(crate) const EXIT_NO_COMPOSITOR: i32 = 3;
 
-#[cfg(target_os = "macos")]
-pub(crate) fn pid_path() -> PathBuf {
-    // $TMPDIR is a per-user directory on macOS (no /run/user equivalent).
-    std::env::temp_dir().join("olsvr.pid")
-}
+/// Exit status when another instance holds the PID-file lock. It differs from the 1 of a
+/// failure, so the autostart unit can leave a refused start alone (`RestartPreventExitStatus`).
+pub(crate) const EXIT_ALREADY_RUNNING: i32 = 4;
 
 /// Applies the command-line overrides, then validates the result, so a bad value from either
 /// source is replaced before any layer reads it.
@@ -109,25 +107,19 @@ pub(crate) fn merge_cli(config: &mut Config, args: &RunArgs) {
     }
 }
 
-/// SIGTERM the PID recorded in the pidfile, if present. Returns the PID signaled.
-fn kill_pidfile() -> Option<i32> {
-    let path = pid_path();
-    let contents = std::fs::read_to_string(&path).ok()?;
-    let Ok(pid) = contents.trim().parse::<i32>() else {
-        eprintln!("Invalid PID file at {}", path.display());
-        return None;
-    };
-    unsafe { libc::kill(pid, libc::SIGTERM) };
-    let _ = std::fs::remove_file(&path);
-    Some(pid)
-}
-
 #[cfg(target_os = "linux")]
 fn stop() {
-    match kill_pidfile() {
-        Some(pid) => println!("Stopped olsvr (PID {pid})"),
-        None => {
+    match pidfile::stop_running() {
+        Ok(StopOutcome::Stopped(pid)) => println!("Stopped olsvr (PID {pid})"),
+        Ok(StopOutcome::StillRunning(pid)) => {
+            eprintln!("olsvr (PID {pid}) got SIGTERM but has not exited yet");
+        }
+        Ok(StopOutcome::NotRunning) => {
             eprintln!("No running olsvr instance found");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("Cannot signal the running olsvr instance: {e}");
             std::process::exit(1);
         }
     }
@@ -143,12 +135,25 @@ fn stop() {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false);
-    let killed = kill_pidfile().is_some();
-    if booted_out || killed {
-        println!("Stopped olsvr");
-    } else {
-        eprintln!("No running olsvr instance found");
-        std::process::exit(1);
+    let killed = match pidfile::stop_running() {
+        Ok(StopOutcome::NotRunning) => None,
+        Ok(StopOutcome::Stopped(pid)) => Some(pid),
+        Ok(StopOutcome::StillRunning(pid)) => {
+            eprintln!("olsvr (PID {pid}) got SIGTERM but has not exited yet");
+            return;
+        }
+        Err(e) => {
+            eprintln!("Cannot signal the running olsvr instance: {e}");
+            None
+        }
+    };
+    match killed {
+        Some(pid) => println!("Stopped olsvr (PID {pid})"),
+        None if booted_out => println!("Stopped olsvr"),
+        None => {
+            eprintln!("No running olsvr instance found");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -194,7 +199,7 @@ fn exit_on_main_thread_panic() {
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);
         if std::thread::current().name() == Some("main") {
-            let _ = std::fs::remove_file(pid_path());
+            pidfile::remove_if_ours(&pidfile::path());
             unsafe { libc::_exit(1) }
         }
     }));

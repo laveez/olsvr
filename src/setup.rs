@@ -4,18 +4,18 @@ use dialoguer::{Input, Select, theme::ColorfulTheme};
 use serde::de::DeserializeOwned;
 
 use crate::config::{Config, MIN_WEATHER_INTERVAL};
-use crate::pid_path;
+use crate::pidfile::{self, StopOutcome};
 
 fn stop_existing() {
     stop_autostart_service();
 
-    // Kill any process from the PID file
-    let path = pid_path();
-    if let Ok(contents) = std::fs::read_to_string(&path)
-        && let Ok(pid) = contents.trim().parse::<i32>()
-    {
-        unsafe { libc::kill(pid, libc::SIGTERM) };
-        let _ = std::fs::remove_file(&path);
+    // Also an instance started outside autostart, e.g. `olsvr run` in a terminal.
+    match pidfile::stop_running() {
+        Ok(StopOutcome::NotRunning | StopOutcome::Stopped(_)) => {}
+        Ok(StopOutcome::StillRunning(pid)) => {
+            eprintln!("olsvr (PID {pid}) got SIGTERM but has not exited yet");
+        }
+        Err(e) => eprintln!("Cannot stop the running olsvr instance: {e}"),
     }
 }
 

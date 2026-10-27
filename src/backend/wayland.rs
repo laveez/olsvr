@@ -61,12 +61,30 @@ enum DbusIdleEvent {
 
 enum GnomeCommand {
     SetKeepAwake(bool),
+    Rearm,
 }
 
 /// gnome-session's `GSM_INHIBITOR_FLAG_IDLE`.
 const IDLE_INHIBIT_FLAG: u32 = 8;
 /// The app id olsvr's own `always` inhibitor carries, which the idle gate skips.
 const INHIBIT_APP_ID: &str = "olsvr";
+const CALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Consecutive failures after which the monitor replaces its bus connection.
+const RECONNECT_AFTER: u32 = 3;
+/// GetActive retries after a read that got no reply, before the monitor assumes unlocked. The
+/// bound matters because gnome-shell's D-Bus-activated `org.gnome.ScreenSaver` helper exits
+/// without replying wherever gnome-shell is installed but not running.
+const LOCK_READ_RETRIES: u32 = 3;
+
+/// The wait after `failures` failures in a row: 1, 2, 4 and so on, up to 30 s.
+fn retry_delay(failures: u32) -> Duration {
+    Duration::from_secs(1 << failures.saturating_sub(1).min(5)).min(Duration::from_secs(30))
+}
+
+/// libdbus reports a call that timed out this way, and the callee may still act on it later.
+fn is_no_reply(e: &dbus::Error) -> bool {
+    e.name() == Some("org.freedesktop.DBus.Error.NoReply")
+}
 
 /// The main thread's handle on the GNOME D-Bus monitor thread, which owns the session bus
 /// connection.
@@ -92,28 +110,46 @@ impl GnomeSession {
         }
     }
 
+    /// A hide without user input can leave GNOME's idle time past the timeout (under `always`
+    /// olsvr's own inhibitor keeps mutter from resetting it), and the monitor would then wait
+    /// for a resume that never comes. Re-armed, it activates again one timeout later if the
+    /// user is still idle.
+    fn rearm(&self) {
+        // The monitor stops only by panicking, which the closed event channel reports.
+        let _ = self.tx.send(GnomeCommand::Rearm);
+    }
+
     fn locked(&self) -> bool {
         self.locked.load(Ordering::Relaxed)
     }
 }
 
-/// The `always` keep-awake hold: a gnome-session idle inhibitor. gnome-session also drops it
-/// when the monitor thread's connection closes, so a thread that exits cannot leave it behind.
+/// The `always` keep-awake hold: a gnome-session idle inhibitor. gnome-session drops it when
+/// the connection that took it closes, so neither a reconnect nor an exiting thread leaves it
+/// behind.
 #[derive(Default)]
 struct KeepAwakeHold {
     wanted: bool,
     cookie: Option<u32>,
-    take_failed: bool,
+    /// gnome-session answered the last Inhibit with an error.
+    refused: bool,
+    /// Inhibit calls in a row that got no reply.
+    timeouts: u32,
+    /// After an Inhibit without a reply, the next one waits until then.
+    retry_at: Option<Instant>,
 }
 
 impl KeepAwakeHold {
+    /// Returns true when the connection must be replaced.
     fn reconcile(
         &mut self,
         session: &dbus::blocking::Proxy<&dbus::blocking::Connection>,
         locked: bool,
-    ) {
+    ) -> bool {
         if !self.wanted || locked {
-            self.take_failed = false;
+            self.refused = false;
+            self.timeouts = 0;
+            self.retry_at = None;
             if let Some(cookie) = self.cookie.take() {
                 let released: Result<(), dbus::Error> =
                     session.method_call("org.gnome.SessionManager", "Uninhibit", (cookie,));
@@ -122,10 +158,13 @@ impl KeepAwakeHold {
                     Err(e) => log::warn!("Keep-awake: Uninhibit of cookie {cookie} failed: {e}"),
                 }
             }
-            return;
+            return false;
         }
-        if self.cookie.is_some() || self.take_failed {
-            return;
+        if self.cookie.is_some()
+            || self.refused
+            || self.retry_at.is_some_and(|t| Instant::now() < t)
+        {
+            return false;
         }
         let taken: Result<(u32,), dbus::Error> = session.method_call(
             "org.gnome.SessionManager",
@@ -136,23 +175,50 @@ impl KeepAwakeHold {
             Ok((cookie,)) => {
                 log::info!("Keep-awake: holding GNOME idle inhibitor {cookie}");
                 self.cookie = Some(cookie);
+                self.timeouts = 0;
+                false
+            }
+            // gnome-session can still create this inhibitor once it gets to the call, with no
+            // cookie to release it. Closing the connection makes gnome-session drop it.
+            Err(e) if is_no_reply(&e) => {
+                self.timeouts += 1;
+                let delay = retry_delay(self.timeouts);
+                log::warn!(
+                    "Keep-awake: SessionManager.Inhibit failed: {e} (reconnecting, retried in {}s)",
+                    delay.as_secs()
+                );
+                self.retry_at = Some(Instant::now() + delay);
+                true
             }
             Err(e) => {
-                // A timed-out Inhibit can still create the inhibitor later, with no cookie to
-                // release it, so retry only once the hold has been dropped (a lock or a release)
-                // and is wanted again.
-                log::warn!("Keep-awake: SessionManager.Inhibit failed: {e}");
-                self.take_failed = true;
+                log::warn!(
+                    "Keep-awake: SessionManager.Inhibit failed: {e} (retried after the next lock, release or reconnect)"
+                );
+                self.refused = true;
+                false
             }
         }
     }
+
+    /// The cookie belonged to the old connection, and gnome-session dropped it along with it.
+    fn forget_connection(&mut self) {
+        if let Some(cookie) = self.cookie.take() {
+            log::info!(
+                "Keep-awake: GNOME idle inhibitor {cookie} ended with the old D-Bus connection"
+            );
+        }
+        self.refused = false;
+    }
 }
 
-fn get_mutter_idletime(proxy: &dbus::blocking::Proxy<&dbus::blocking::Connection>) -> Option<u64> {
-    proxy
-        .method_call("org.gnome.Mutter.IdleMonitor", "GetIdletime", ())
-        .ok()
-        .map(|(ms,): (u64,)| ms)
+fn get_mutter_idletime(conn: &dbus::blocking::Connection) -> Result<u64, dbus::Error> {
+    let monitor = conn.with_proxy(
+        "org.gnome.Mutter.IdleMonitor",
+        "/org/gnome/Mutter/IdleMonitor/Core",
+        CALL_TIMEOUT,
+    );
+    let (ms,): (u64,) = monitor.method_call("org.gnome.Mutter.IdleMonitor", "GetIdletime", ())?;
+    Ok(ms)
 }
 
 /// Whether an app other than olsvr holds a gnome-session idle inhibitor. Inhibitors relayed by
@@ -193,7 +259,7 @@ fn idle_inhibited_by_others(
 
 /// Keeps `locked` equal to GNOME's lock screen state. The match callback runs inside
 /// `Connection::process`.
-fn track_lock_screen(conn: &dbus::blocking::Connection, locked: &Arc<AtomicBool>) {
+fn watch_lock_screen(conn: &dbus::blocking::Connection, locked: &Arc<AtomicBool>) {
     let flag = Arc::clone(locked);
     let watch = conn.add_match(
         MatchRule::new_signal("org.gnome.ScreenSaver", "ActiveChanged"),
@@ -205,108 +271,277 @@ fn track_lock_screen(conn: &dbus::blocking::Connection, locked: &Arc<AtomicBool>
     if let Err(e) = watch {
         log::warn!("D-Bus: cannot watch the GNOME lock screen: {e}");
     }
+}
+
+/// Stores GNOME's lock screen state into `locked`. Only a missing reply is returned, because
+/// then a lock screen service exists but did not answer, as when gnome-shell stalls. Any other
+/// failure counts as unlocked, as on desktops without GNOME's lock screen.
+fn read_lock_screen(
+    conn: &dbus::blocking::Connection,
+    locked: &AtomicBool,
+) -> Result<(), dbus::Error> {
     let screensaver = conn.with_proxy(
         "org.gnome.ScreenSaver",
         "/org/gnome/ScreenSaver",
-        Duration::from_secs(2),
+        CALL_TIMEOUT,
     );
     let active: Result<(bool,), dbus::Error> =
         screensaver.method_call("org.gnome.ScreenSaver", "GetActive", ());
     match active {
         Ok((active,)) => locked.store(active, Ordering::Relaxed),
-        Err(e) => log::warn!("D-Bus: GetActive failed, assuming unlocked: {e}"),
+        Err(e) => {
+            locked.store(false, Ordering::Relaxed);
+            if is_no_reply(&e) {
+                return Err(e);
+            }
+            log::warn!("D-Bus: GetActive failed, assuming unlocked: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// Why the monitor stops using its connection.
+enum Exit {
+    Reconnect,
+    /// The main loop has gone.
+    Stop,
+}
+
+/// The monitor thread's state, kept across connections.
+struct IdleMonitor {
+    events: Sender<DbusIdleEvent>,
+    commands: mpsc::Receiver<GnomeCommand>,
+    /// Shared with `GnomeSession::locked`. False whenever the state cannot be read, so a stale
+    /// true cannot refuse activations for good.
+    locked: Arc<AtomicBool>,
+    timeout_ms: u64,
+    hold: KeepAwakeHold,
+    /// GetActive retries left after the read at connect got no reply, one per tick in which
+    /// GetIdletime answers. While any are left the session may be locked, so the monitor
+    /// neither activates nor takes the hold; after the last one it assumes unlocked.
+    lock_retries: u32,
+    was_locked: bool,
+    was_idle: bool,
+    /// One timeout after a hide without input; no activation before it.
+    activate_after: Option<Instant>,
+    /// Failed attempts in a row to read the idle time, connection failures included.
+    failures: u32,
+    next_poll: Instant,
+    gate_warned_at: Option<Instant>,
+}
+
+impl Drop for IdleMonitor {
+    fn drop(&mut self) {
+        self.locked.store(false, Ordering::Relaxed);
     }
 }
 
+impl IdleMonitor {
+    /// Retries until the session bus accepts a connection.
+    fn connect(&mut self) -> dbus::blocking::Connection {
+        loop {
+            match dbus::blocking::Connection::new_session() {
+                Ok(conn) => {
+                    watch_lock_screen(&conn, &self.locked);
+                    self.lock_retries = match read_lock_screen(&conn, &self.locked) {
+                        Ok(()) => 0,
+                        Err(e) => {
+                            log::warn!(
+                                "D-Bus: GetActive got no reply, so activation waits for a retry: {e}"
+                            );
+                            LOCK_READ_RETRIES
+                        }
+                    };
+                    self.hold.forget_connection();
+                    return conn;
+                }
+                Err(e) => {
+                    self.locked.store(false, Ordering::Relaxed);
+                    self.record_failure("cannot connect to the session bus", &e);
+                    std::thread::sleep(self.next_poll.saturating_duration_since(Instant::now()));
+                }
+            }
+        }
+    }
+
+    fn tick(&mut self, conn: &dbus::blocking::Connection) -> Result<(), Exit> {
+        // `process` handles at most one message per call and returns false once `wait` passes
+        // without one. It fails only once the connection is gone.
+        let mut wait = Duration::from_secs(1);
+        loop {
+            match conn.process(wait) {
+                Ok(true) => wait = Duration::ZERO,
+                Ok(false) => break,
+                Err(e) => {
+                    self.record_failure("lost the session bus connection", &e);
+                    std::thread::sleep(self.next_poll.saturating_duration_since(Instant::now()));
+                    return Err(Exit::Reconnect);
+                }
+            }
+        }
+
+        while let Ok(command) = self.commands.try_recv() {
+            match command {
+                GnomeCommand::SetKeepAwake(on) => self.hold.wanted = on,
+                GnomeCommand::Rearm => {
+                    self.was_idle = false;
+                    self.activate_after =
+                        Some(Instant::now() + Duration::from_millis(self.timeout_ms));
+                }
+            }
+        }
+
+        let session = conn.with_proxy(
+            "org.gnome.SessionManager",
+            "/org/gnome/SessionManager",
+            CALL_TIMEOUT,
+        );
+        if self.lock_retries == 0 {
+            let locked = self.locked.load(Ordering::Relaxed);
+            if locked != self.was_locked {
+                self.was_locked = locked;
+                self.send(if locked {
+                    DbusIdleEvent::Locked
+                } else {
+                    DbusIdleEvent::Unlocked
+                })?;
+            }
+            if self.hold.reconcile(&session, locked) {
+                return Err(Exit::Reconnect);
+            }
+        }
+
+        if Instant::now() < self.next_poll {
+            return Ok(());
+        }
+        let idle_ms = match get_mutter_idletime(conn) {
+            Ok(ms) => ms,
+            Err(e) => {
+                self.record_failure("GetIdletime failed", &e);
+                return match self.failures {
+                    RECONNECT_AFTER => Err(Exit::Reconnect),
+                    _ => Ok(()),
+                };
+            }
+        };
+        if self.failures > 0 {
+            log::info!(
+                "D-Bus: GetIdletime works again after {} failures",
+                self.failures
+            );
+            self.failures = 0;
+        }
+
+        if self.lock_retries > 0 {
+            match read_lock_screen(conn, &self.locked) {
+                Ok(()) => self.lock_retries = 0,
+                Err(e) => {
+                    self.lock_retries -= 1;
+                    if self.lock_retries > 0 {
+                        log::debug!("D-Bus: GetActive still gets no reply: {e}");
+                        return Ok(());
+                    }
+                    log::warn!("D-Bus: GetActive failed, assuming unlocked: {e}");
+                }
+            }
+        }
+        if self.locked.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        if !self.was_idle && idle_ms >= self.timeout_ms && self.activation_allowed(&session) {
+            log::info!("D-Bus: user idle ({idle_ms}ms) — activating screensaver");
+            self.send(DbusIdleEvent::Idle)?;
+            self.was_idle = true;
+        } else if self.was_idle && idle_ms < self.timeout_ms {
+            log::info!("D-Bus: user resumed — deactivating screensaver");
+            self.send(DbusIdleEvent::Resumed)?;
+            self.was_idle = false;
+        }
+        Ok(())
+    }
+
+    /// Not within one timeout of a hide without input, and not while another app inhibits idle.
+    fn activation_allowed(
+        &mut self,
+        session: &dbus::blocking::Proxy<&dbus::blocking::Connection>,
+    ) -> bool {
+        if self.activate_after.is_some_and(|t| Instant::now() < t) {
+            return false;
+        }
+        match idle_inhibited_by_others(session) {
+            Ok(false) => true,
+            Ok(true) => {
+                log::debug!("D-Bus: idle inhibited — skipping activation");
+                false
+            }
+            Err(e) => {
+                if self
+                    .gate_warned_at
+                    .is_none_or(|t| t.elapsed() >= Duration::from_secs(60))
+                {
+                    log::warn!("D-Bus: cannot read idle inhibitors, skipping activation: {e}");
+                    self.gate_warned_at = Some(Instant::now());
+                }
+                false
+            }
+        }
+    }
+
+    /// Counts a failed attempt to read the idle time, connection failures included, and
+    /// schedules the next one.
+    fn record_failure(&mut self, what: &str, e: &dbus::Error) {
+        self.failures += 1;
+        let delay = retry_delay(self.failures);
+        self.next_poll = Instant::now() + delay;
+        let (n, secs) = (self.failures, delay.as_secs());
+        match n {
+            1 => log::warn!("D-Bus: {what}, retrying in {secs}s: {e}"),
+            n if n < RECONNECT_AFTER => {
+                log::info!("D-Bus: {what} ({n} failures in a row), retrying in {secs}s: {e}")
+            }
+            RECONNECT_AFTER => log::error!(
+                "D-Bus: {what} ({n} failures in a row), so no idle source works; reconnecting, then retrying in {secs}s: {e}"
+            ),
+            _ => log::debug!("D-Bus: {what} ({n} failures in a row), retrying in {secs}s: {e}"),
+        }
+    }
+
+    fn send(&self, event: DbusIdleEvent) -> Result<(), Exit> {
+        self.events.send(event).map_err(|_| Exit::Stop)
+    }
+}
+
+/// Never returns while the main loop runs. Failed calls are retried with a growing delay, and
+/// the connection is replaced when it drops, after `RECONNECT_AFTER` failures in a row, and
+/// after an Inhibit that got no reply.
 fn dbus_idle_monitor_loop(
-    tx: Sender<DbusIdleEvent>,
+    events: Sender<DbusIdleEvent>,
     commands: mpsc::Receiver<GnomeCommand>,
     locked: Arc<AtomicBool>,
     timeout_ms: u64,
 ) {
-    let conn = match dbus::blocking::Connection::new_session() {
-        Ok(c) => c,
-        Err(e) => {
-            log::error!("D-Bus session connection failed: {e}");
-            return;
-        }
+    let mut monitor = IdleMonitor {
+        events,
+        commands,
+        locked,
+        timeout_ms,
+        hold: KeepAwakeHold::default(),
+        lock_retries: 0,
+        was_locked: false,
+        was_idle: false,
+        activate_after: None,
+        failures: 0,
+        next_poll: Instant::now(),
+        gate_warned_at: None,
     };
-    let idle_proxy = conn.with_proxy(
-        "org.gnome.Mutter.IdleMonitor",
-        "/org/gnome/Mutter/IdleMonitor/Core",
-        std::time::Duration::from_secs(2),
-    );
-    let session_proxy = conn.with_proxy(
-        "org.gnome.SessionManager",
-        "/org/gnome/SessionManager",
-        std::time::Duration::from_secs(2),
-    );
-    track_lock_screen(&conn, &locked);
-
-    let mut was_idle = false;
-    let mut was_locked = false;
-    let mut hold = KeepAwakeHold::default();
-    let mut gate_warned_at: Option<Instant> = None;
     loop {
-        // `process` handles at most one message per call and returns false once `wait` passes
-        // without one. It fails only when the bus is gone, which GetIdletime below reports too.
-        let mut wait = Duration::from_secs(1);
-        while let Ok(true) = conn.process(wait) {
-            wait = Duration::ZERO;
-        }
-
-        let is_locked = locked.load(Ordering::Relaxed);
-        if is_locked != was_locked {
-            was_locked = is_locked;
-            let event = if is_locked {
-                DbusIdleEvent::Locked
-            } else {
-                DbusIdleEvent::Unlocked
-            };
-            if tx.send(event).is_err() {
-                return;
+        let conn = monitor.connect();
+        loop {
+            match monitor.tick(&conn) {
+                Ok(()) => {}
+                Err(Exit::Reconnect) => break,
+                Err(Exit::Stop) => return,
             }
-        }
-
-        while let Ok(GnomeCommand::SetKeepAwake(on)) = commands.try_recv() {
-            hold.wanted = on;
-        }
-        hold.reconcile(&session_proxy, is_locked);
-
-        let Some(idle_ms) = get_mutter_idletime(&idle_proxy) else {
-            log::error!("GetIdletime call failed — stopping D-Bus monitor");
-            return;
-        };
-
-        if is_locked {
-            continue;
-        }
-        if !was_idle && idle_ms >= timeout_ms {
-            match idle_inhibited_by_others(&session_proxy) {
-                Ok(false) => {}
-                Ok(true) => {
-                    log::debug!("D-Bus: idle inhibited — skipping activation");
-                    continue;
-                }
-                Err(e) => {
-                    if gate_warned_at.is_none_or(|t| t.elapsed() >= Duration::from_secs(60)) {
-                        log::warn!("D-Bus: cannot read idle inhibitors, skipping activation: {e}");
-                        gate_warned_at = Some(Instant::now());
-                    }
-                    continue;
-                }
-            }
-            log::info!("D-Bus: user idle ({idle_ms}ms) — activating screensaver");
-            if tx.send(DbusIdleEvent::Idle).is_err() {
-                return;
-            }
-            was_idle = true;
-        } else if was_idle && idle_ms < timeout_ms {
-            log::info!("D-Bus: user resumed — deactivating screensaver");
-            if tx.send(DbusIdleEvent::Resumed).is_err() {
-                return;
-            }
-            was_idle = false;
         }
     }
 }
@@ -433,6 +668,15 @@ impl App {
 
     fn dismiss(&mut self, qh: &QueueHandle<Self>) {
         self.on_event(BackendEvent::DismissInput, qh);
+    }
+
+    /// A hide the user did not cause (a failed show, or the compositor closing the window),
+    /// after which the GNOME monitor has to re-arm.
+    fn hide_without_input(&mut self, ev: BackendEvent, qh: &QueueHandle<Self>) {
+        self.on_event(ev, qh);
+        if let Some(gnome) = &self.gnome {
+            gnome.rearm();
+        }
     }
 
     fn deactivate(&mut self) {
@@ -626,7 +870,7 @@ impl SeatHandler for App {
 
 impl WindowHandler for App {
     fn request_close(&mut self, _conn: &Connection, qh: &QueueHandle<Self>, _window: &Window) {
-        self.on_event(BackendEvent::SurfaceClosed, qh);
+        self.hide_without_input(BackendEvent::SurfaceClosed, qh);
     }
 
     fn configure(
@@ -673,7 +917,7 @@ impl WindowHandler for App {
                     // A GPU reset can leave the instance itself unusable, so the next show
                     // starts from a fresh one.
                     self.gpu_instance = None;
-                    self.on_event(BackendEvent::ShowFailed, qh);
+                    self.hide_without_input(BackendEvent::ShowFailed, qh);
                 }
             } else if let Some(ref mut comp) = ss.compositor {
                 comp.resize(w, h);
@@ -897,7 +1141,6 @@ pub fn run(args: RunArgs) {
     let xdg_shell = XdgShell::bind(&globals, &qh).expect("xdg_wm_base not available");
 
     let idle_notifier: Option<ExtIdleNotifierV1> = globals.bind(&qh, 1..=1, ()).ok();
-    let mut dbus_idle = false;
     if idle_notifier.is_none() {
         log::info!("ext_idle_notifier_v1 not available — trying D-Bus fallback");
     }
@@ -983,40 +1226,38 @@ pub fn run(args: RunArgs) {
         log::info!("Setting up Wayland idle notification: {}ms", timeout_ms);
         let notification = notifier.get_idle_notification(timeout_ms, seat, &qh, ());
         app.idle_notification = Some(notification);
-    } else if app.idle_notifier.is_none() {
-        let timeout_ms = app.config.timeout as u64 * 60 * 1000;
-        if let Ok(conn) = dbus::blocking::Connection::new_session() {
-            let proxy = conn.with_proxy(
-                "org.gnome.Mutter.IdleMonitor",
-                "/org/gnome/Mutter/IdleMonitor/Core",
-                std::time::Duration::from_secs(2),
+    } else {
+        if app.idle_notifier.is_some() {
+            log::error!(
+                "ext_idle_notifier_v1 is available but has no seat to watch, so idle detection falls back to the GNOME D-Bus monitor"
             );
-            if get_mutter_idletime(&proxy).is_some() {
-                log::info!("Using D-Bus Mutter IdleMonitor fallback: {}ms", timeout_ms);
-                let (tx, rx) = channel::channel::<DbusIdleEvent>();
-                app.gnome = Some(GnomeSession::spawn(tx, timeout_ms));
-                event_loop
-                    .handle()
-                    .insert_source(rx, |event, _, app: &mut App| {
-                        if let channel::Event::Msg(msg) = event {
-                            match msg {
-                                DbusIdleEvent::Idle => app.signal_activate = true,
-                                DbusIdleEvent::Resumed => app.signal_deactivate = true,
-                                DbusIdleEvent::Locked => {
-                                    log::info!("Session locked");
-                                    app.signal_locked = true;
-                                }
-                                DbusIdleEvent::Unlocked => log::info!("Session unlocked"),
-                            }
-                        }
-                    })
-                    .expect("Failed to insert D-Bus channel source");
-                dbus_idle = true;
-            }
         }
-        if !dbus_idle {
-            log::error!("No idle detection available — use --now or --activate");
-        }
+        // Started without a probe: mutter claims its D-Bus name asynchronously, and the monitor
+        // retries until it answers.
+        let timeout_ms = app.config.timeout as u64 * 60 * 1000;
+        log::info!("Using D-Bus Mutter IdleMonitor fallback: {}ms", timeout_ms);
+        let (tx, rx) = channel::channel::<DbusIdleEvent>();
+        app.gnome = Some(GnomeSession::spawn(tx, timeout_ms));
+        event_loop
+            .handle()
+            .insert_source(rx, |event, _, app: &mut App| {
+                let channel::Event::Msg(msg) = event else {
+                    log::error!(
+                        "D-Bus monitor has stopped, so the saver no longer activates on idle"
+                    );
+                    return;
+                };
+                match msg {
+                    DbusIdleEvent::Idle => app.signal_activate = true,
+                    DbusIdleEvent::Resumed => app.signal_deactivate = true,
+                    DbusIdleEvent::Locked => {
+                        log::info!("Session locked");
+                        app.signal_locked = true;
+                    }
+                    DbusIdleEvent::Unlocked => log::info!("Session unlocked"),
+                }
+            })
+            .expect("Failed to insert D-Bus channel source");
     }
 
     // Apply any startup commands (e.g. hold keep-awake under the "always" policy). This comes
@@ -1089,7 +1330,7 @@ pub fn run(args: RunArgs) {
                 }
                 // No frame callback is requested, so the 100ms fallback retries.
                 FrameOutcome::Skipped => {}
-                FrameOutcome::Broken => app.on_event(BackendEvent::ShowFailed, &qh),
+                FrameOutcome::Broken => app.hide_without_input(BackendEvent::ShowFailed, &qh),
             }
 
             if !first_frame

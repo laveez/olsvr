@@ -46,7 +46,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
 
 use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
 
-use crate::compositor::{Compositor, DebugInfo, FrameOutcome};
+use crate::compositor::{Compositor, DebugInfo, FrameOutcome, warning_due};
 use crate::config::{Config, KeepAwake};
 use crate::data::{self, DataCache};
 use crate::engine::{BackendEvent, Engine, EngineCommand};
@@ -1010,7 +1010,7 @@ pub fn run(args: RunArgs) {
             }
         }
         if !dbus_idle {
-            log::warn!("No idle detection available — use --now or --activate");
+            log::error!("No idle detection available — use --now or --activate");
         }
     }
 
@@ -1019,12 +1019,23 @@ pub fn run(args: RunArgs) {
     let init_cmds = app.engine.init();
     app.apply(init_cmds, &qh);
 
+    let has_compositor = |app: &App| {
+        app.screensaver
+            .as_ref()
+            .is_some_and(|ss| ss.compositor.is_some())
+    };
+    let mut slow_frame_warned_at: Option<Instant> = None;
+    let mut dispatch_blocked_warned_at: Option<Instant> = None;
     while app.running {
+        let had_compositor = has_compositor(&app);
         let t0 = Instant::now();
         event_loop
             .dispatch(std::time::Duration::from_millis(16), &mut app)
             .expect("Event loop dispatch failed");
         let dispatch_ms = t0.elapsed().as_millis();
+        // The dispatch that creates the compositor builds the GPU device, so every show takes
+        // that long and it is not a stall.
+        let first_frame = !had_compositor && has_compositor(&app);
 
         if app.signal_activate {
             app.signal_activate = false;
@@ -1076,12 +1087,19 @@ pub fn run(args: RunArgs) {
                 FrameOutcome::Broken => app.on_event(BackendEvent::ShowFailed, &qh),
             }
 
-            if dispatch_ms > 50 || draw_ms > 50 {
+            if !first_frame
+                && (dispatch_ms > 50 || draw_ms > 50)
+                && warning_due(&mut slow_frame_warned_at)
+            {
                 log::warn!("Slow frame: dispatch={dispatch_ms}ms draw={draw_ms}ms");
             }
             app.ready_to_draw = false;
             app.last_draw = Some(Instant::now());
-        } else if app.screensaver.is_some() && dispatch_ms > 50 {
+        } else if app.screensaver.is_some()
+            && !first_frame
+            && dispatch_ms > 50
+            && warning_due(&mut dispatch_blocked_warned_at)
+        {
             log::warn!("Dispatch blocked {dispatch_ms}ms (no draw)");
         }
     }

@@ -22,7 +22,7 @@ const MAX_FRAME_DT_SECS: f32 = 0.25;
 /// Validation errors in a row, with no frame presented between them, after which
 /// the surface counts as broken.
 const MAX_VALIDATION_ERRORS: u32 = 3;
-const WARN_INTERVAL: Duration = Duration::from_secs(1);
+const WARN_INTERVAL: Duration = Duration::from_secs(10);
 
 pub struct DebugInfo {
     pub frame_count: u64,
@@ -62,6 +62,8 @@ pub struct Compositor {
     validation_errors: u32,
     last_validation_warn: Option<Instant>,
     last_prepare_warn: Option<Instant>,
+    last_render_warn: Option<Instant>,
+    last_text_render_warn: Option<Instant>,
 }
 
 /// Scale `(w, h)` down proportionally so neither exceeds `max` (the GPU's max
@@ -80,7 +82,7 @@ fn clamp_to_max(w: u32, h: u32, max: u32) -> (u32, u32) {
 
 /// Rate limit for a warning that can repeat every frame: true at most once per
 /// `WARN_INTERVAL`, and then records the time in `last`.
-fn warning_due(last: &mut Option<Instant>) -> bool {
+pub(crate) fn warning_due(last: &mut Option<Instant>) -> bool {
     if last.is_some_and(|t| t.elapsed() < WARN_INTERVAL) {
         return false;
     }
@@ -203,6 +205,8 @@ impl Compositor {
             validation_errors: 0,
             last_validation_warn: None,
             last_prepare_warn: None,
+            last_render_warn: None,
+            last_text_render_warn: None,
         })
     }
 
@@ -313,7 +317,9 @@ impl Compositor {
             self.surface.configure(&self.device, &self.config);
         }
 
-        if texture_ms > 50 || submit_ms > 50 || present_ms > 50 {
+        if (texture_ms > 50 || submit_ms > 50 || present_ms > 50)
+            && warning_due(&mut self.last_render_warn)
+        {
             log::warn!(
                 "Render: texture={texture_ms}ms submit={submit_ms}ms present={present_ms}ms"
             );
@@ -428,7 +434,7 @@ impl Compositor {
     }
 
     /// A black clear, with the layers drawn over it when `draw_layers` is set.
-    fn encode_frame(&self, target: &wgpu::Texture, draw_layers: bool) -> wgpu::CommandBuffer {
+    fn encode_frame(&mut self, target: &wgpu::Texture, draw_layers: bool) -> wgpu::CommandBuffer {
         let view = target.create_view(&Default::default());
         let mut encoder = self.device.create_command_encoder(&Default::default());
         let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -451,6 +457,7 @@ impl Compositor {
             if let Err(e) = self
                 .text_renderer
                 .render(&self.text_atlas, &self.viewport, &mut pass)
+                && warning_due(&mut self.last_text_render_warn)
             {
                 log::warn!("Text render failed, presenting without it: {e}");
             }

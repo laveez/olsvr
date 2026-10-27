@@ -149,7 +149,10 @@ fn stop() {
 }
 
 fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(
+        env_logger::Env::default().default_filter_or("error,olsvr=info,wgpu=warn"),
+    )
+    .init();
     let cli = Cli::parse();
 
     match cli.command {

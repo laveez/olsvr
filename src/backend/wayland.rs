@@ -547,9 +547,9 @@ fn dbus_idle_monitor_loop(
 }
 
 struct Screensaver {
-    #[allow(dead_code)]
-    window: Window,
+    /// Before `window`, which must outlive the wgpu Surface that draws to its wl_surface.
     compositor: Option<Compositor>,
+    window: Window,
     inhibitor: Option<ZwpIdleInhibitorV1>,
     activated_at: Instant,
 }
@@ -559,7 +559,6 @@ struct App {
     /// from disk, and after an NVIDIA update that has not been rebooted into, the new driver
     /// no longer matches the loaded kernel module. `None` from a failed show until the next.
     gpu_instance: Option<wgpu::Instance>,
-    conn: Connection,
     registry_state: RegistryState,
     compositor_state: CompositorState,
     output_state: OutputState,
@@ -587,6 +586,15 @@ struct App {
     last_draw: Option<Instant>,
     debug: bool,
     frame_count: u64,
+    /// Last, so it drops after the Compositor: wgpu's Surface borrows the raw `wl_display`, and
+    /// this is the connection's last clone once `run()` has dropped the event loop.
+    conn: Connection,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.deactivate();
+    }
 }
 
 impl App {
@@ -682,6 +690,7 @@ impl App {
     fn deactivate(&mut self) {
         if let Some(ss) = self.screensaver.take() {
             log::info!("Deactivating screensaver");
+            drop(ss.compositor);
             if let Some(inhibitor) = ss.inhibitor {
                 inhibitor.destroy();
             }
@@ -1099,6 +1108,21 @@ fn vulkan_instance() -> wgpu::Instance {
     })
 }
 
+/// Exit status when there is no compositor to connect to. It is distinct from a crash's 1, so
+/// the systemd unit can be set not to restart on it.
+const EXIT_NO_COMPOSITOR: i32 = 3;
+
+/// A dispatch error means the compositor connection is gone: a logout, a compositor crash, or
+/// the compositor dropping olsvr. The process exits without dropping anything, since the
+/// swapchain's teardown would run against the dead connection.
+fn dispatch_or_exit(event_loop: &mut EventLoop<'_, App>, timeout: Duration, app: &mut App) {
+    if let Err(e) = event_loop.dispatch(timeout, app) {
+        log::error!("Event loop dispatch failed, exiting: {e}");
+        let _ = std::fs::remove_file(pid_path());
+        unsafe { libc::_exit(1) }
+    }
+}
+
 pub fn run(args: RunArgs) {
     // With DISPLAY set, NVIDIA's Vulkan driver connects to X11 and leaks a /dev/nvidiactl and
     // renderD fd pair per destroyed instance (NVIDIA bug 6446591, fixed in 615.71.09).
@@ -1132,7 +1156,14 @@ pub fn run(args: RunArgs) {
     let path = pid_path();
     std::fs::write(&path, std::process::id().to_string()).expect("Failed to write PID file");
 
-    let conn = Connection::connect_to_env().expect("Failed to connect to Wayland");
+    let conn = match Connection::connect_to_env() {
+        Ok(conn) => conn,
+        Err(e) => {
+            log::error!("Cannot connect to the Wayland compositor: {e}");
+            let _ = std::fs::remove_file(&path);
+            std::process::exit(EXIT_NO_COMPOSITOR);
+        }
+    };
     let (globals, event_queue) = registry_queue_init(&conn).expect("Failed to init registry");
     let qh = event_queue.handle();
 
@@ -1165,7 +1196,6 @@ pub fn run(args: RunArgs) {
 
     let mut app = App {
         gpu_instance: Some(vulkan_instance()),
-        conn: conn.clone(),
         registry_state: RegistryState::new(&globals),
         compositor_state,
         output_state: OutputState::new(&globals, &qh),
@@ -1193,6 +1223,7 @@ pub fn run(args: RunArgs) {
         last_draw: None,
         debug: args.debug,
         frame_count: 0,
+        conn: conn.clone(),
     };
 
     let mut event_loop: EventLoop<App> = EventLoop::try_new().expect("Failed to create event loop");
@@ -1216,9 +1247,7 @@ pub fn run(args: RunArgs) {
         })
         .expect("Failed to insert signal source");
 
-    event_loop
-        .dispatch(std::time::Duration::from_millis(100), &mut app)
-        .expect("Initial dispatch failed");
+    dispatch_or_exit(&mut event_loop, Duration::from_millis(100), &mut app);
 
     if let (Some(notifier), Some(seat)) = (&app.idle_notifier, &app.seat) {
         let timeout_ms =
@@ -1275,9 +1304,7 @@ pub fn run(args: RunArgs) {
     while app.running {
         let had_compositor = has_compositor(&app);
         let t0 = Instant::now();
-        event_loop
-            .dispatch(std::time::Duration::from_millis(16), &mut app)
-            .expect("Event loop dispatch failed");
+        dispatch_or_exit(&mut event_loop, Duration::from_millis(16), &mut app);
         let dispatch_ms = t0.elapsed().as_millis();
         // The dispatch that creates the compositor builds the GPU device, so every show takes
         // that long and it is not a stall.

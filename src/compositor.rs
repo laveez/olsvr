@@ -206,10 +206,13 @@ impl Compositor {
         })
     }
 
-    /// Linux constructor: create the wgpu instance and a surface from the Wayland
-    /// display + surface, then build the portable renderer.
+    /// Linux constructor: create a surface on the backend's process-wide `instance`
+    /// from the Wayland display + surface, then build the portable renderer. `None`
+    /// when the surface, adapter or device cannot be created.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     pub fn new_wayland(
+        instance: &wgpu::Instance,
         conn: &Connection,
         wl_surface: &WlSurface,
         width: u32,
@@ -217,12 +220,7 @@ impl Compositor {
         layers: Vec<Box<dyn Layer>>,
         layer_configs: &[toml::value::Table],
         data_cache: Arc<RwLock<DataCache>>,
-    ) -> Self {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN,
-            ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
-
+    ) -> Option<Self> {
         let display_ptr = conn.backend().display_ptr();
         let surface_ptr = wl_surface.id().as_ptr();
 
@@ -235,11 +233,17 @@ impl Compositor {
                     NonNull::new_unchecked(surface_ptr as *mut _),
                 )),
             })
-        }
-        .expect("Failed to create wgpu surface");
+        };
+        let surface = match surface {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Failed to create wgpu surface: {e}");
+                return None;
+            }
+        };
 
         Self::new(
-            &instance,
+            instance,
             surface,
             width,
             height,
@@ -247,7 +251,6 @@ impl Compositor {
             layer_configs,
             data_cache,
         )
-        .expect("Failed to create compositor")
     }
 
     pub fn resize(&mut self, width: u32, height: u32) {

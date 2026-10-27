@@ -5,6 +5,7 @@ After=graphical-session.target
 [Service]
 Type=simple
 Environment=RUST_LOG=info
+UnsetEnvironment=DISPLAY XAUTHORITY
 ExecStart=%h/.cargo/bin/olsvr
 Restart=on-failure
 RestartSec=5

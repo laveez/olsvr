@@ -20,8 +20,8 @@ pub enum BackendEvent {
     Resume,
     DismissInput,
     /// The saver surface cannot render. Both backends send it when a frame reports the
-    /// surface or device broken, and macOS also when no saver surface could be created
-    /// for a `Show` (e.g. zero attached displays).
+    /// surface or device broken, and when no saver surface could be created for a `Show`
+    /// (a failed GPU init, or on macOS zero attached displays).
     ShowFailed,
     /// The saver surface is gone or covered. Wayland sends it when the compositor or the
     /// user closes the window, or when the GNOME session locks; macOS sends it when the

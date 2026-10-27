@@ -320,6 +320,10 @@ struct Screensaver {
 }
 
 struct App {
+    /// One instance per process, created at startup: a new instance loads the Vulkan drivers
+    /// from disk, and after an NVIDIA update that has not been rebooted into, the new driver
+    /// no longer matches the loaded kernel module. `None` from a failed show until the next.
+    gpu_instance: Option<wgpu::Instance>,
     conn: Connection,
     registry_state: RegistryState,
     compositor_state: CompositorState,
@@ -624,7 +628,7 @@ impl WindowHandler for App {
     fn configure(
         &mut self,
         _conn: &Connection,
-        _qh: &QueueHandle<Self>,
+        qh: &QueueHandle<Self>,
         window: &Window,
         configure: WindowConfigure,
         _serial: u32,
@@ -650,7 +654,9 @@ impl WindowHandler for App {
             if ss.compositor.is_none() {
                 log::info!("Window configured: {w}x{h}, initializing compositor");
                 let (layer_list, layer_configs) = self.config.build_layers(self.debug);
-                let comp = Compositor::new_wayland(
+                let instance = self.gpu_instance.get_or_insert_with(vulkan_instance);
+                ss.compositor = Compositor::new_wayland(
+                    instance,
                     &self.conn,
                     window.wl_surface(),
                     w,
@@ -659,7 +665,12 @@ impl WindowHandler for App {
                     &layer_configs,
                     self.data_cache.clone(),
                 );
-                ss.compositor = Some(comp);
+                if ss.compositor.is_none() {
+                    // A GPU reset can leave the instance itself unusable, so the next show
+                    // starts from a fresh one.
+                    self.gpu_instance = None;
+                    self.on_event(BackendEvent::ShowFailed, qh);
+                }
             } else if let Some(ref mut comp) = ss.compositor {
                 comp.resize(w, h);
             }
@@ -833,7 +844,22 @@ delegate_seat!(App);
 delegate_xdg_shell!(App);
 delegate_xdg_window!(App);
 
+fn vulkan_instance() -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::VULKAN,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    })
+}
+
 pub fn run(args: RunArgs) {
+    // With DISPLAY set, NVIDIA's Vulkan driver connects to X11 and leaks a /dev/nvidiactl and
+    // renderD fd pair per destroyed instance (NVIDIA bug 6446591, fixed in 615.71.09).
+    // SAFETY: no thread has been started yet, so nothing can read the environment concurrently.
+    unsafe {
+        std::env::remove_var("DISPLAY");
+        std::env::remove_var("XAUTHORITY");
+    }
+
     // --activate: send SIGUSR1 to running instance and exit
     if args.activate {
         let path = pid_path();
@@ -884,7 +910,14 @@ pub fn run(args: RunArgs) {
     // so a one-element display list is sufficient.
     let engine = Engine::new(config.activation, vec![0]);
 
+    // Blocks these signals for this thread only, so it comes before the Vulkan instance below:
+    // threads the drivers start inherit the mask, and a signal one of them took would kill
+    // the process instead of reaching the event loop.
+    let signals = Signals::new(&[Signal::SIGUSR1, Signal::SIGTERM, Signal::SIGINT])
+        .expect("Failed to create signal source");
+
     let mut app = App {
+        gpu_instance: Some(vulkan_instance()),
         conn: conn.clone(),
         registry_state: RegistryState::new(&globals),
         compositor_state,
@@ -920,8 +953,6 @@ pub fn run(args: RunArgs) {
         .insert(event_loop.handle())
         .expect("Failed to insert Wayland source");
 
-    let signals = Signals::new(&[Signal::SIGUSR1, Signal::SIGTERM, Signal::SIGINT])
-        .expect("Failed to create signal source");
     event_loop
         .handle()
         .insert_source(signals, |event, _, app| match event.signal() {

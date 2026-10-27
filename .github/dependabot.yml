@@ -35,5 +35,8 @@ updates:
     groups:
       actions:
         patterns: ["*"]
+    # Its refs select a Rust toolchain (`@1.89` is the MSRV job), not an action release.
+    ignore:
+      - dependency-name: "dtolnay/rust-toolchain"
     commit-message:
       prefix: "Chore"

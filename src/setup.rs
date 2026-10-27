@@ -2,7 +2,7 @@ use std::process::Command;
 
 use dialoguer::{Input, Select, theme::ColorfulTheme};
 
-use crate::config::Config;
+use crate::config::{Config, MIN_WEATHER_INTERVAL};
 use crate::pid_path;
 
 fn stop_existing() {
@@ -302,10 +302,21 @@ fn prompt_weather(theme: &ColorfulTheme, config: &mut Config) {
     let default_interval = existing
         .as_ref()
         .and_then(|t| t.get("update_interval").and_then(|v| v.as_integer()))
-        .unwrap_or(600) as u32;
+        .map_or(600, |seconds| {
+            seconds.clamp(MIN_WEATHER_INTERVAL.into(), u32::MAX.into()) as u32
+        });
     let interval: u32 = Input::with_theme(theme)
         .with_prompt("Update interval (seconds)")
         .default(default_interval)
+        .validate_with(|seconds: &u32| {
+            if *seconds >= MIN_WEATHER_INTERVAL {
+                Ok(())
+            } else {
+                Err(format!(
+                    "The interval must be at least {MIN_WEATHER_INTERVAL} seconds"
+                ))
+            }
+        })
         .interact_text()
         .unwrap();
 

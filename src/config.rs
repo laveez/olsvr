@@ -250,7 +250,8 @@ impl Config {
         (layer_list, layer_configs)
     }
 
-    /// Return the weather location if a weather layer is configured, along with its update interval.
+    /// Return the weather location if a weather layer is configured, along with its update
+    /// interval in seconds, raised to `MIN_WEATHER_INTERVAL` when the configured one is lower.
     pub fn weather_config(&self) -> Option<(String, u64)> {
         if let Some(ref layers_cfg) = self.layers {
             for table in layers_cfg {
@@ -263,8 +264,14 @@ impl Config {
                     let interval = table
                         .get("update_interval")
                         .and_then(|v| v.as_integer())
-                        .unwrap_or(600) as u64;
-                    return Some((location, interval));
+                        .unwrap_or(600);
+                    let floor = i64::from(MIN_WEATHER_INTERVAL);
+                    if interval < floor {
+                        log::warn!(
+                            "Config: update_interval = {interval} is under {floor} seconds, using {floor}"
+                        );
+                    }
+                    return Some((location, interval.max(floor) as u64));
                 }
             }
         }
@@ -272,6 +279,8 @@ impl Config {
     }
 }
 
+/// Shortest weather `update_interval` in seconds: FMI's forecast changes hourly.
+pub const MIN_WEATHER_INTERVAL: u32 = 300;
 const FONT_SIZES: RangeInclusive<i64> = 1..=2000;
 const FONT_SIZE_RULE: &str = "a whole number from 1 to 2000";
 /// Wider than an 8K display (7680 px). From about 2^24, `pad + 1.0 == pad` in f32, and the empty

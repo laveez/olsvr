@@ -341,6 +341,7 @@ struct App {
     config: Config,
     engine: Engine,
     data_cache: Arc<RwLock<DataCache>>,
+    weather_started: bool,
     width: u32,
     height: u32,
     running: bool,
@@ -375,13 +376,16 @@ impl App {
             .filter(|_| self.config.activation.keep_awake != KeepAwake::Off)
             .map(|mgr| mgr.create_inhibitor(window.wl_surface(), qh, ()));
 
-        // Start weather fetch thread if a weather layer is configured
-        if let Some((location, interval_secs)) = self.config.weather_config() {
+        // Start the weather fetch thread once if a weather layer is configured.
+        if !self.weather_started
+            && let Some((location, interval_secs)) = self.config.weather_config()
+        {
             data::start_fetch_thread(
                 self.data_cache.clone(),
                 location,
-                std::time::Duration::from_secs(interval_secs),
+                Duration::from_secs(interval_secs),
             );
+            self.weather_started = true;
         }
 
         self.screensaver = Some(Screensaver {
@@ -935,6 +939,7 @@ pub fn run(args: RunArgs) {
         config,
         engine,
         data_cache,
+        weather_started: false,
         width: 0,
         height: 0,
         running: true,

@@ -110,7 +110,7 @@ The weather overlay shows a colored icon, temperature, and wind speed below the 
 | Field | Description | Default |
 |---|---|---|
 | `location` | City name for FMI weather data | `helsinki` |
-| `update_interval` | Weather fetch interval (seconds) | `600` |
+| `update_interval` | Weather fetch interval (seconds), at least `300` | `600` |
 | `font_size` | Weather text size (pixels) | `28` |
 | `icon_font` | Nerd Font family for weather icons | `MesloLGS NF` |
 

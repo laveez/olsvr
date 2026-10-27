@@ -127,6 +127,7 @@ impl Layer for WeatherLayer {
 
         let spans: Vec<(&str, Attrs<'_>)> = if let Ok(cache) = cache.read()
             && let Some(ref weather) = cache.weather
+            && weather.is_fresh()
         {
             let (icon_char, [ir, ig, ib]) = weather_icon(weather.weather_symbol);
             icon_str = icon_char.to_string();

@@ -64,6 +64,9 @@ pub fn run() {
         let Some(mut config) = load_or_back_up() else {
             return;
         };
+        for problem in config.validate() {
+            eprintln!("  {problem}");
+        }
         seed_from_clock_layer(&mut config);
         config
     } else {
@@ -185,7 +188,7 @@ fn seed_from_clock_layer(config: &mut Config) {
         .layers
         .iter()
         .flatten()
-        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("clock"))
+        .find(|t| crate::config::layer_type(t) == "clock")
     else {
         return;
     };
@@ -366,7 +369,7 @@ fn prompt_weather(theme: &ColorfulTheme, config: &mut Config) {
     let default_font_size = existing
         .as_ref()
         .and_then(|t| t.get("font_size").and_then(|v| v.as_integer()))
-        .unwrap_or(28) as u32;
+        .unwrap_or(24) as u32;
     let font_size: u32 = Input::with_theme(theme)
         .with_prompt("Weather font size")
         .default(default_font_size)
@@ -400,7 +403,7 @@ fn prompt_weather(theme: &ColorfulTheme, config: &mut Config) {
         .iter_mut()
         .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("weather"))
     {
-        *existing = weather;
+        existing.extend(weather);
     } else {
         layers.push(weather);
     }
@@ -413,10 +416,10 @@ fn rebuild_layers(config: &mut Config) {
             .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("weather"))
     });
 
-    let has_clock = config.layers.as_ref().is_some_and(|l| {
-        l.iter()
-            .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("clock"))
-    });
+    let has_clock = config
+        .layers
+        .as_ref()
+        .is_some_and(|l| l.iter().any(|t| crate::config::layer_type(t) == "clock"));
 
     if !has_weather && !has_clock {
         // Neither layer exists: the flat fields render as the single clock
@@ -470,7 +473,7 @@ fn rebuild_layers(config: &mut Config) {
         // Update existing clock layer from flat config fields
         let clock = layers
             .iter_mut()
-            .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("clock"))
+            .find(|t| crate::config::layer_type(t) == "clock")
             .unwrap();
         clock.insert(
             "font_size".into(),

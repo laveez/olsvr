@@ -183,10 +183,7 @@ impl Config {
             let mut list = Vec::new();
             let mut cfgs = Vec::new();
             for (i, table) in layers_cfg.iter().enumerate() {
-                let layer_type = table
-                    .get("type")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("clock");
+                let layer_type = layer_type(table);
                 let Some(layer) = layers::create_layer(layer_type) else {
                     log::error!(
                         "Config: layer {}: type = {layer_type:?} is unknown, skipping the layer",
@@ -281,6 +278,14 @@ impl Config {
 
 /// Shortest weather `update_interval` in seconds: FMI's forecast changes hourly.
 pub const MIN_WEATHER_INTERVAL: u32 = 300;
+/// The type `build_layers` gives a table: a missing or non-string `type` is a clock.
+pub fn layer_type(table: &toml::value::Table) -> &str {
+    table
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("clock")
+}
+
 const FONT_SIZES: RangeInclusive<i64> = 1..=2000;
 const FONT_SIZE_RULE: &str = "a whole number from 1 to 2000";
 /// Wider than an 8K display (7680 px). From about 2^24, `pad + 1.0 == pad` in f32, and the empty

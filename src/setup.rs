@@ -6,16 +6,28 @@ use serde::de::DeserializeOwned;
 use crate::config::{Config, MIN_WEATHER_INTERVAL};
 use crate::pidfile::{self, StopOutcome};
 
-fn stop_existing() {
-    stop_autostart_service();
-
-    // Also an instance started outside autostart, e.g. `olsvr run` in a terminal.
+/// An instance that still holds the PID lock would show its own saver in place of the preview
+/// (Linux) or refuse the preview (macOS). `false` when it does not stop.
+fn stop_running_instance(autostart_was_active: bool) -> bool {
     match pidfile::stop_running() {
-        Ok(StopOutcome::NotRunning | StopOutcome::Stopped(_)) => {}
-        Ok(StopOutcome::StillRunning(pid)) => {
-            eprintln!("olsvr (PID {pid}) got SIGTERM but has not exited yet");
+        Ok(StopOutcome::NotRunning) => true,
+        Ok(StopOutcome::Stopped(pid)) => {
+            // Right after the autostart service stopped, this is that instance still exiting
+            if !autostart_was_active {
+                println!(
+                    "  Stopped olsvr (PID {pid}), which ran outside autostart. Setup does not start it again."
+                );
+            }
+            true
         }
-        Err(e) => eprintln!("Cannot stop the running olsvr instance: {e}"),
+        Ok(StopOutcome::StillRunning(pid)) => {
+            eprintln!("  olsvr (PID {pid}) got SIGTERM but has not exited yet, so no preview.");
+            false
+        }
+        Err(e) => {
+            eprintln!("  Cannot stop the running olsvr instance, so no preview: {e}");
+            false
+        }
     }
 }
 
@@ -29,10 +41,102 @@ fn stop_autostart_service() {
 
 #[cfg(target_os = "macos")]
 fn stop_autostart_service() {
-    let uid = unsafe { libc::getuid() };
     let _ = Command::new("launchctl")
-        .args(["bootout", &format!("gui/{uid}/{}", crate::LAUNCHD_LABEL)])
+        .args(["bootout", &launchd_target()])
         .output();
+    // `bootout` can return while launchd is still unloading the job, and `bootstrap` fails then
+    for _ in 0..20 {
+        if !autostart_active() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn autostart_active() -> bool {
+    Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "olsvr.service"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(target_os = "macos")]
+fn autostart_active() -> bool {
+    launchctl(&["print", &launchd_target()]).is_ok()
+}
+
+#[cfg(target_os = "linux")]
+fn start_autostart_service() -> bool {
+    if systemctl_user(&["start", "olsvr.service"]) {
+        return true;
+    }
+    eprintln!("  The service is stopped.");
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn start_autostart_service() -> bool {
+    let domain = launchd_domain();
+    let plist_path = launchd_plist_path();
+    let mut failure = String::new();
+    // A job that is already loaded gives the same "Input/output error" as one still unloading
+    for _ in 0..5 {
+        match launchctl(&["bootstrap", &domain, &plist_path]) {
+            Ok(()) => return true,
+            Err(e) => failure = e,
+        }
+        if autostart_active() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    // Older macOS without `bootstrap`: fall back to legacy load.
+    if launchctl(&["load", "-w", &plist_path]).is_ok() {
+        return true;
+    }
+    eprintln!("  launchctl bootstrap failed: {failure}");
+    eprintln!(
+        "  The login agent is not loaded. Load it with: launchctl bootstrap {domain} {plist_path}"
+    );
+    false
+}
+
+/// Runs `systemctl --user` and prints what failed.
+#[cfg(target_os = "linux")]
+fn systemctl_user(args: &[&str]) -> bool {
+    let failure = match Command::new("systemctl").arg("--user").args(args).status() {
+        Ok(status) if status.success() => return true,
+        Ok(status) => status.to_string(),
+        Err(e) => e.to_string(),
+    };
+    eprintln!("  systemctl --user {} failed: {failure}", args.join(" "));
+    false
+}
+
+#[cfg(target_os = "macos")]
+fn launchctl(args: &[&str]) -> Result<(), String> {
+    match Command::new("launchctl").args(args).output() {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_domain() -> String {
+    format!("gui/{}", unsafe { libc::getuid() })
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_target() -> String {
+    format!("{}/{}", launchd_domain(), crate::LAUNCHD_LABEL)
+}
+
+#[cfg(target_os = "macos")]
+fn launchd_plist_path() -> String {
+    let home = std::env::var("HOME").expect("HOME not set");
+    format!("{home}/Library/LaunchAgents/{}.plist", crate::LAUNCHD_LABEL)
 }
 
 /// Warn about a missing display server (Wayland-only; no-op on macOS).
@@ -48,6 +152,13 @@ fn check_prerequisites() {
 fn check_prerequisites() {}
 
 pub fn run() {
+    if !wizard() {
+        std::process::exit(1);
+    }
+}
+
+/// `false` when a step failed, which the step has already said.
+fn wizard() -> bool {
     let theme = ColorfulTheme::default();
 
     println!();
@@ -55,14 +166,13 @@ pub fn run() {
     println!("  OLED screensaver");
     println!();
 
-    stop_existing();
     check_prerequisites();
 
     let mut config = if Config::exists() {
         println!("  Found existing config at {}", Config::path().display());
         println!();
         let Some(mut config) = load_or_back_up() else {
-            return;
+            return false;
         };
         for problem in config.validate() {
             eprintln!("  {problem}");
@@ -73,6 +183,7 @@ pub fn run() {
         Config::default()
     };
 
+    let mut ok = true;
     loop {
         prompt_timing(&theme, &mut config);
         prompt_display(&theme, &mut config);
@@ -81,7 +192,7 @@ pub fn run() {
 
         if let Err(e) = config.save() {
             eprintln!("Failed to save config: {e}");
-            return;
+            return false;
         }
         println!();
         println!("  Config saved to {}", Config::path().display());
@@ -96,14 +207,7 @@ pub fn run() {
             .unwrap();
 
         if do_preview == 0 {
-            let exe = std::env::current_exe().unwrap_or_else(|_| "olsvr".into());
-            if let Ok(mut child) = Command::new(exe).args(["run", "--now"]).spawn() {
-                println!("  Preview running. Press Enter here to stop.");
-                println!();
-                let _ = std::io::stdin().read_line(&mut String::new());
-                let _ = child.kill();
-                let _ = child.wait();
-            }
+            ok &= run_preview();
         }
 
         // Satisfaction check
@@ -129,7 +233,7 @@ pub fn run() {
                 rebuild_layers(&mut config);
                 if let Err(e) = config.save() {
                     eprintln!("Failed to save config: {e}");
-                    return;
+                    return false;
                 }
                 continue;
             }
@@ -138,7 +242,7 @@ pub fn run() {
                 rebuild_layers(&mut config);
                 if let Err(e) = config.save() {
                     eprintln!("Failed to save config: {e}");
-                    return;
+                    return false;
                 }
                 continue;
             }
@@ -150,11 +254,67 @@ pub fn run() {
         }
     }
 
-    offer_autostart_install(&theme);
+    ok &= offer_autostart_install(&theme);
+    if ok {
+        println!();
+        println!("  Setup complete!");
+        println!();
+    }
+    ok
+}
 
+/// Shows the preview with the autostart service stopped, and starts the service again after.
+/// `false` when the service does not come back.
+fn run_preview() -> bool {
+    let _sigint = IgnoreSigint::new();
+    let autostart_was_active = autostart_active();
+    if autostart_was_active {
+        stop_autostart_service();
+    }
+    if stop_running_instance(autostart_was_active) {
+        show_preview();
+    }
+    !autostart_was_active || start_autostart_service()
+}
+
+fn show_preview() {
+    let exe = std::env::current_exe().unwrap_or_else(|_| "olsvr".into());
+    let mut child = match Command::new(exe).args(["run", "--now"]).spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            eprintln!("  Cannot start the preview: {e}");
+            return;
+        }
+    };
+    println!("  Preview running. Press Enter here to end the preview.");
     println!();
-    println!("  Setup complete!");
-    println!();
+    let _ = std::io::stdin().read_line(&mut String::new());
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+extern "C" fn ignore_sigint(_: libc::c_int) {}
+
+/// Ctrl-C reaches the wizard and the preview together. While the autostart service is stopped,
+/// only the preview may end on it, so that the wizard can start the service again. A handler
+/// rather than SIG_IGN, because exec resets a handler and the preview keeps the default.
+struct IgnoreSigint(libc::sighandler_t);
+
+impl IgnoreSigint {
+    fn new() -> Self {
+        Self(unsafe {
+            libc::signal(
+                libc::SIGINT,
+                ignore_sigint as *const () as libc::sighandler_t,
+            )
+        })
+    }
+}
+
+impl Drop for IgnoreSigint {
+    fn drop(&mut self) {
+        unsafe { libc::signal(libc::SIGINT, self.0) };
+    }
 }
 
 /// The existing config, or the defaults once a file that does not load has been copied to
@@ -513,36 +673,106 @@ fn rebuild_layers(config: &mut Config) {
     }
 }
 
+/// Restarts the autostart service, so that it reads the saved config.
+fn restart_autostart() -> bool {
+    let _sigint = IgnoreSigint::new();
+    stop_autostart_service();
+    // An instance still exiting holds the PID lock, and the new one would be refused
+    let _ = pidfile::stop_running();
+    start_autostart_service()
+}
+
+/// What an autostart that is not reinstalled needs: a running service restarts to read the saved
+/// config, any other state stays as it is and is reported.
+fn refresh_autostart() -> bool {
+    if !autostart_active() {
+        report_autostart_state();
+        return true;
+    }
+    println!("  Restarting autostart to apply the new config.");
+    if !restart_autostart() || !report_service_state() {
+        return false;
+    }
+    println!("  Autostart is running with the new config.");
+    true
+}
+
 #[cfg(target_os = "linux")]
-fn offer_autostart_install(theme: &ColorfulTheme) {
-    println!();
-    let install = Select::with_theme(theme)
-        .with_prompt("Install as systemd user service?")
-        .items(["Yes", "No"])
-        .default(0)
-        .interact()
-        .unwrap();
-    if install == 0 {
-        install_systemd_service(theme);
+fn report_autostart_state() {
+    let loaded = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "-p",
+            "LoadState",
+            "--value",
+            "olsvr.service",
+        ])
+        .output()
+        .ok()
+        .filter(|output| output.status.success());
+    match loaded
+        .as_ref()
+        .map(|output| String::from_utf8_lossy(&output.stdout))
+    {
+        Some(state) if state.trim() == "not-found" => println!("  Autostart is not installed."),
+        Some(_) => println!(
+            "  Autostart is installed but not running. Start it with: systemctl --user start olsvr.service"
+        ),
+        None => eprintln!(
+            "  Could not read the service state. Check it with: systemctl --user status olsvr.service"
+        ),
     }
 }
 
 #[cfg(target_os = "macos")]
-fn offer_autostart_install(theme: &ColorfulTheme) {
+fn report_autostart_state() {
+    let plist_path = launchd_plist_path();
+    if std::path::Path::new(&plist_path).exists() {
+        println!("  The login agent is installed but not loaded, so it starts at the next login.");
+        println!(
+            "  Load it now with: launchctl bootstrap {} {plist_path}",
+            launchd_domain()
+        );
+    } else {
+        println!("  Autostart is not installed.");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn offer_autostart_install(theme: &ColorfulTheme) -> bool {
     println!();
     let install = Select::with_theme(theme)
-        .with_prompt("Install as a login agent (launchd, no Dock icon)?")
+        .with_prompt("Install or refresh autostart (systemd user service)?")
         .items(["Yes", "No"])
         .default(0)
         .interact()
         .unwrap();
     if install == 0 {
-        install_launchd_agent();
+        install_systemd_service(theme)
+    } else {
+        refresh_autostart()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn offer_autostart_install(theme: &ColorfulTheme) -> bool {
+    println!();
+    let install = Select::with_theme(theme)
+        .with_prompt("Install or refresh autostart (login agent, no Dock icon)?")
+        .items(["Yes", "No"])
+        .default(0)
+        .interact()
+        .unwrap();
+    if install == 0 {
+        install_launchd_agent()
+    } else {
+        refresh_autostart()
     }
 }
 
 #[cfg(target_os = "linux")]
-fn install_systemd_service(theme: &ColorfulTheme) {
+fn install_systemd_service(theme: &ColorfulTheme) -> bool {
     let home = std::env::var("HOME").expect("HOME not set");
     let service_dir = format!("{home}/.config/systemd/user");
     let service_path = format!("{service_dir}/olsvr.service");
@@ -551,7 +781,7 @@ fn install_systemd_service(theme: &ColorfulTheme) {
         Ok(exe) => exe.to_string_lossy().into_owned(),
         Err(e) => {
             eprintln!("Cannot find the path of the olsvr binary: {e}");
-            return;
+            return false;
         }
     };
     if exe.contains("/target/") {
@@ -568,13 +798,13 @@ fn install_systemd_service(theme: &ColorfulTheme) {
             .unwrap();
         if proceed == 0 {
             println!("  Service not installed.");
-            return;
+            return refresh_autostart();
         }
     }
 
     if let Err(e) = std::fs::create_dir_all(&service_dir) {
         eprintln!("Failed to create {service_dir}: {e}");
-        return;
+        return false;
     }
 
     // ExecStart expands the specifier % even inside quotes.
@@ -606,38 +836,46 @@ fn install_systemd_service(theme: &ColorfulTheme) {
     );
     if let Err(e) = std::fs::write(&service_path, unit) {
         eprintln!("Failed to write service file: {e}");
-        return;
+        return false;
     }
     println!("  Installed service to {service_path}");
 
-    enable_and_restart_service();
+    // The service's instance exits while another one holds the PID lock
+    if !autostart_active()
+        && let Ok(StopOutcome::Stopped(pid)) = pidfile::stop_running()
+    {
+        println!(
+            "  Stopped olsvr (PID {pid}), which ran outside autostart; the service takes over."
+        );
+    }
+
+    let running = enable_and_restart_service();
     print_session_note();
+    running
 }
 
 #[cfg(target_os = "linux")]
-fn enable_and_restart_service() {
+fn enable_and_restart_service() -> bool {
     let steps: [&[&str]; 3] = [
         &["daemon-reload"],
         &["enable", "olsvr.service"],
         &["restart", "olsvr.service"],
     ];
-    for args in steps {
-        let failure = match Command::new("systemctl").arg("--user").args(args).status() {
-            Ok(status) if status.success() => continue,
-            Ok(status) => status.to_string(),
-            Err(e) => e.to_string(),
-        };
-        eprintln!("  systemctl --user {} failed: {failure}", args.join(" "));
+    if !steps.iter().all(|args| systemctl_user(args)) {
         eprintln!("  The service was not started. Fix the error above and run setup again.");
-        return;
+        return false;
     }
-    report_service_state();
+    let running = report_service_state();
+    if running {
+        println!("  Service enabled and running.");
+    }
+    running
 }
 
 /// With `Type=exec` the restart returns as soon as the binary has started, so a daemon that
 /// exits at once only shows after a short wait.
 #[cfg(target_os = "linux")]
-fn report_service_state() {
+fn report_service_state() -> bool {
     std::thread::sleep(std::time::Duration::from_secs(2));
     let shown = Command::new("systemctl")
         .args([
@@ -652,7 +890,7 @@ fn report_service_state() {
         eprintln!(
             "  Could not read the service state. Check it with: systemctl --user status olsvr.service"
         );
-        return;
+        return false;
     };
     let shown = String::from_utf8_lossy(&shown.stdout);
     let property = |name: &str| {
@@ -667,13 +905,13 @@ fn report_service_state() {
         property("NRestarts"),
     );
     if active == "active" && result == "success" && restarts == "0" {
-        println!("  Service enabled and running.");
-    } else {
-        eprintln!(
-            "  The service did not stay up: ActiveState={active}, Result={result}, NRestarts={restarts}"
-        );
-        eprintln!("  See why with: journalctl --user -u olsvr.service -e");
+        return true;
     }
+    eprintln!(
+        "  The service did not stay up: ActiveState={active}, Result={result}, NRestarts={restarts}"
+    );
+    eprintln!("  See why with: journalctl --user -u olsvr.service -e");
+    false
 }
 
 /// GNOME and KDE bring up graphical-session.target, which the unit is bound to; a bare
@@ -781,15 +1019,15 @@ fn create_app_bundle() -> Option<String> {
 }
 
 #[cfg(target_os = "macos")]
-fn install_launchd_agent() {
+fn install_launchd_agent() -> bool {
     let home = std::env::var("HOME").expect("HOME not set");
     let label = crate::LAUNCHD_LABEL;
     let agents_dir = format!("{home}/Library/LaunchAgents");
-    let plist_path = format!("{agents_dir}/{label}.plist");
+    let plist_path = launchd_plist_path();
 
     if let Err(e) = std::fs::create_dir_all(&agents_dir) {
         eprintln!("Failed to create {agents_dir}: {e}");
-        return;
+        return false;
     }
 
     // Launch from the LSUIElement app bundle so the agent has no Dock icon; fall
@@ -840,26 +1078,48 @@ fn install_launchd_agent() {
 
     if let Err(e) = std::fs::write(&plist_path, plist) {
         eprintln!("Failed to write launchd plist: {e}");
-        return;
+        return false;
     }
     println!("  Installed agent to {plist_path}");
 
     // Reload: bootout any previous instance, then bootstrap into the GUI domain.
-    let uid = unsafe { libc::getuid() };
-    let domain = format!("gui/{uid}");
-    let _ = Command::new("launchctl")
-        .args(["bootout", &format!("{domain}/{label}")])
-        .output();
-    let bootstrapped = Command::new("launchctl")
-        .args(["bootstrap", &domain, &plist_path])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !bootstrapped {
-        // Older macOS without `bootstrap`: fall back to legacy load.
-        let _ = Command::new("launchctl")
-            .args(["load", "-w", &plist_path])
-            .status();
+    if !restart_autostart() || !report_service_state() {
+        return false;
     }
     println!("  Agent enabled and started.");
+    true
+}
+
+/// Waits for the agent to run. The first launch of a freshly signed bundle can take a few seconds.
+#[cfg(target_os = "macos")]
+fn report_service_state() -> bool {
+    for _ in 0..20 {
+        if agent_running() {
+            return true;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    eprintln!("  The login agent is loaded, but olsvr is not running.");
+    eprintln!(
+        "  See ~/Library/Logs/olsvr.log, or: launchctl print {}",
+        launchd_target()
+    );
+    false
+}
+
+/// launchd shows a `pid` line for a job it has started. The PID lock is the second opinion,
+/// which an agent that still runs a build from before the lock does not give.
+#[cfg(target_os = "macos")]
+fn agent_running() -> bool {
+    let printed = Command::new("launchctl")
+        .args(["print", &launchd_target()])
+        .output();
+    let has_pid = printed.is_ok_and(|output| {
+        String::from_utf8_lossy(&output.stdout).lines().any(|line| {
+            line.trim()
+                .strip_prefix("pid = ")
+                .is_some_and(|pid| pid.parse::<u32>().is_ok())
+        })
+    });
+    has_pid || matches!(pidfile::running_pid(&pidfile::path()), Ok(Some(_)))
 }

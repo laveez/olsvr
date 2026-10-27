@@ -1,6 +1,7 @@
 use std::process::Command;
 
 use dialoguer::{Input, Select, theme::ColorfulTheme};
+use serde::de::DeserializeOwned;
 
 use crate::config::{Config, MIN_WEATHER_INTERVAL};
 use crate::pid_path;
@@ -60,9 +61,10 @@ pub fn run() {
     let mut config = if Config::exists() {
         println!("  Found existing config at {}", Config::path().display());
         println!();
-        let Some(config) = load_or_back_up() else {
+        let Some(mut config) = load_or_back_up() else {
             return;
         };
+        seed_from_clock_layer(&mut config);
         config
     } else {
         Config::default()
@@ -175,6 +177,33 @@ fn load_or_back_up() -> Option<Config> {
     Some(Config::default())
 }
 
+/// Sets the flat fields to what the first clock layer renders, so the prompts default to the
+/// values in use and `rebuild_layers` writes them back unchanged. A key the layer lacks, or sets
+/// to a value that does not fit its field, gets the default the saver falls back to.
+fn seed_from_clock_layer(config: &mut Config) {
+    let Some(clock) = config
+        .layers
+        .iter()
+        .flatten()
+        .find(|t| t.get("type").and_then(|v| v.as_str()) == Some("clock"))
+    else {
+        return;
+    };
+    let defaults = Config::default();
+    config.font_size = layer_value(clock, "font_size").unwrap_or(defaults.font_size);
+    config.font_family = layer_value(clock, "font_family").unwrap_or(defaults.font_family);
+    config.time_format = layer_value(clock, "time_format").unwrap_or(defaults.time_format);
+    config.date_format = layer_value(clock, "date_format").unwrap_or(defaults.date_format);
+    config.color = layer_value(clock, "color").unwrap_or(defaults.color);
+    config.hold = layer_value(clock, "hold").unwrap_or(defaults.hold);
+    config.fade_duration = layer_value(clock, "fade_duration").unwrap_or(defaults.fade_duration);
+    config.edge_padding = layer_value(clock, "edge_padding").unwrap_or(defaults.edge_padding);
+}
+
+fn layer_value<T: DeserializeOwned>(layer: &toml::value::Table, key: &str) -> Option<T> {
+    layer.get(key)?.clone().try_into().ok()
+}
+
 fn prompt_timing(theme: &ColorfulTheme, config: &mut Config) {
     println!();
     println!("  -- Timing --");
@@ -217,14 +246,18 @@ fn prompt_display(theme: &ColorfulTheme, config: &mut Config) {
         .interact_text()
         .unwrap();
 
-    let families = ["sans-serif", "serif", "monospace", "cursive", "fantasy"];
+    let mut families = vec!["sans-serif", "serif", "monospace", "cursive", "fantasy"];
+    // A family outside the generic ones is offered too, so that Enter keeps it
+    if !families.contains(&config.font_family.as_str()) {
+        families.push(&config.font_family);
+    }
     let current_idx = families
         .iter()
         .position(|f| *f == config.font_family)
         .unwrap_or(0);
     let family_idx = Select::with_theme(theme)
         .with_prompt("Font family")
-        .items(families)
+        .items(&families)
         .default(current_idx)
         .interact()
         .unwrap();
@@ -246,12 +279,22 @@ fn prompt_display(theme: &ColorfulTheme, config: &mut Config) {
         .interact_text()
         .unwrap();
 
+    let [r, g, b] = config.color;
+    let brightest = r.max(g).max(b);
     let brightness: u8 = Input::with_theme(theme)
         .with_prompt("Brightness (0-255)")
-        .default(config.color[0])
+        .default(brightest)
         .interact_text()
         .unwrap();
-    config.color = [brightness, brightness, brightness];
+    // Every component scales with the brightest, so a tint survives and the default changes
+    // nothing; black has no tint, so it becomes grey
+    config.color = if brightest == 0 {
+        [brightness; 3]
+    } else {
+        config
+            .color
+            .map(|c| (f32::from(c) * f32::from(brightness) / f32::from(brightest)).round() as u8)
+    };
 
     config.edge_padding = Input::with_theme(theme)
         .with_prompt("Edge padding (pixels)")
@@ -370,17 +413,18 @@ fn rebuild_layers(config: &mut Config) {
             .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("weather"))
     });
 
-    if !has_weather {
-        // No weather — drop layers so flat config is used for the single clock
+    let has_clock = config.layers.as_ref().is_some_and(|l| {
+        l.iter()
+            .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("clock"))
+    });
+
+    if !has_weather && !has_clock {
+        // Neither layer exists: the flat fields render as the single clock
         config.layers = None;
         return;
     }
 
-    // Weather enabled — ensure clock layer exists in the layers array
     let layers = config.layers.get_or_insert_with(Vec::new);
-    let has_clock = layers
-        .iter()
-        .any(|t| t.get("type").and_then(|v| v.as_str()) == Some("clock"));
 
     if !has_clock {
         // Build clock layer from flat config fields

@@ -523,7 +523,7 @@ fn offer_autostart_install(theme: &ColorfulTheme) {
         .interact()
         .unwrap();
     if install == 0 {
-        install_systemd_service();
+        install_systemd_service(theme);
     }
 }
 
@@ -542,70 +542,164 @@ fn offer_autostart_install(theme: &ColorfulTheme) {
 }
 
 #[cfg(target_os = "linux")]
-fn install_systemd_service() {
+fn install_systemd_service(theme: &ColorfulTheme) {
     let home = std::env::var("HOME").expect("HOME not set");
     let service_dir = format!("{home}/.config/systemd/user");
     let service_path = format!("{service_dir}/olsvr.service");
+
+    let exe = match std::env::current_exe() {
+        Ok(exe) => exe.to_string_lossy().into_owned(),
+        Err(e) => {
+            eprintln!("Cannot find the path of the olsvr binary: {e}");
+            return;
+        }
+    };
+    if exe.contains("/target/") {
+        eprintln!("  Warning: {exe} is inside a cargo target directory.");
+        eprintln!(
+            "  The service would run that build, and fail to start once the directory is cleaned."
+        );
+        eprintln!("  Run cargo install and set up from the installed olsvr to avoid that.");
+        let proceed = Select::with_theme(theme)
+            .with_prompt("Install the service with this binary anyway?")
+            .items(["No", "Yes"])
+            .default(0)
+            .interact()
+            .unwrap();
+        if proceed == 0 {
+            println!("  Service not installed.");
+            return;
+        }
+    }
 
     if let Err(e) = std::fs::create_dir_all(&service_dir) {
         eprintln!("Failed to create {service_dir}: {e}");
         return;
     }
 
-    // Find the service file — check next to the binary, then cwd
-    let service_source = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("olsvr.service")))
-        .filter(|p| p.exists())
-        .or_else(|| {
-            let cwd = std::env::current_dir().ok()?.join("olsvr.service");
-            cwd.exists().then_some(cwd)
-        });
+    // ExecStart expands the specifier % even inside quotes.
+    let exec_start = exe.replace('%', "%%");
 
-    match service_source {
-        Some(src) => {
-            if let Err(e) = std::fs::copy(&src, &service_path) {
-                eprintln!("Failed to copy service file: {e}");
-                return;
-            }
-        }
-        None => {
-            // Generate a minimal service file
-            let contents = format!(
-                "[Unit]\n\
-                 Description=OLED Screensaver\n\
-                 After=graphical-session.target\n\
-                 \n\
-                 [Service]\n\
-                 Type=simple\n\
-                 ExecStart={home}/.cargo/bin/olsvr\n\
-                 Restart=on-failure\n\
-                 RestartSec=5\n\
-                 \n\
-                 [Install]\n\
-                 WantedBy=graphical-session.target\n"
-            );
-            if let Err(e) = std::fs::write(&service_path, contents) {
-                eprintln!("Failed to write service file: {e}");
-                return;
-            }
-        }
+    // Keep olsvr.service, the documentation copy of this unit, in sync. RestartPreventExitStatus
+    // lists the exits a restart cannot fix: no Wayland compositor, and already running.
+    let unit = format!(
+        "[Unit]\n\
+         Description=OLED Screensaver\n\
+         After=graphical-session.target\n\
+         PartOf=graphical-session.target\n\
+         StartLimitIntervalSec=60\n\
+         StartLimitBurst=5\n\
+         \n\
+         [Service]\n\
+         Type=exec\n\
+         Environment=RUST_LOG=info\n\
+         UnsetEnvironment=DISPLAY XAUTHORITY\n\
+         ExecStart=\"{exec_start}\" run\n\
+         Restart=on-failure\n\
+         RestartSec=5\n\
+         RestartPreventExitStatus={} {}\n\
+         \n\
+         [Install]\n\
+         WantedBy=graphical-session.target\n",
+        crate::EXIT_NO_COMPOSITOR,
+        crate::EXIT_ALREADY_RUNNING
+    );
+    if let Err(e) = std::fs::write(&service_path, unit) {
+        eprintln!("Failed to write service file: {e}");
+        return;
     }
-
     println!("  Installed service to {service_path}");
 
-    // Reload, enable, and (re)start
-    let _ = Command::new("systemctl")
-        .args(["--user", "daemon-reload"])
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "enable", "olsvr.service"])
-        .status();
-    let _ = Command::new("systemctl")
-        .args(["--user", "restart", "olsvr.service"])
-        .status();
+    enable_and_restart_service();
+    print_session_note();
+}
 
-    println!("  Service enabled and started.");
+#[cfg(target_os = "linux")]
+fn enable_and_restart_service() {
+    let steps: [&[&str]; 3] = [
+        &["daemon-reload"],
+        &["enable", "olsvr.service"],
+        &["restart", "olsvr.service"],
+    ];
+    for args in steps {
+        let failure = match Command::new("systemctl").arg("--user").args(args).status() {
+            Ok(status) if status.success() => continue,
+            Ok(status) => status.to_string(),
+            Err(e) => e.to_string(),
+        };
+        eprintln!("  systemctl --user {} failed: {failure}", args.join(" "));
+        eprintln!("  The service was not started. Fix the error above and run setup again.");
+        return;
+    }
+    report_service_state();
+}
+
+/// With `Type=exec` the restart returns as soon as the binary has started, so a daemon that
+/// exits at once only shows after a short wait.
+#[cfg(target_os = "linux")]
+fn report_service_state() {
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    let shown = Command::new("systemctl")
+        .args([
+            "--user",
+            "show",
+            "-p",
+            "ActiveState,Result,NRestarts",
+            "olsvr.service",
+        ])
+        .output();
+    let Some(shown) = shown.ok().filter(|output| output.status.success()) else {
+        eprintln!(
+            "  Could not read the service state. Check it with: systemctl --user status olsvr.service"
+        );
+        return;
+    };
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    let property = |name: &str| {
+        shown
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_prefix('='))
+            .unwrap_or("unknown")
+    };
+    let (active, result, restarts) = (
+        property("ActiveState"),
+        property("Result"),
+        property("NRestarts"),
+    );
+    if active == "active" && result == "success" && restarts == "0" {
+        println!("  Service enabled and running.");
+    } else {
+        eprintln!(
+            "  The service did not stay up: ActiveState={active}, Result={result}, NRestarts={restarts}"
+        );
+        eprintln!("  See why with: journalctl --user -u olsvr.service -e");
+    }
+}
+
+/// GNOME and KDE bring up graphical-session.target, which the unit is bound to; a bare
+/// compositor does not.
+#[cfg(target_os = "linux")]
+fn print_session_note() {
+    let desktop = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .to_lowercase();
+    let is = |name: &str| desktop.split(':').any(|part| part == name);
+    if is("gnome") || is("kde") {
+        return;
+    }
+    println!();
+    println!(
+        "  The service starts with graphical-session.target, which this desktop may not bring up."
+    );
+    if is("sway") || std::env::var_os("SWAYSOCK").is_some() {
+        println!("  Start olsvr from your sway config instead:");
+        println!("      exec olsvr run");
+    } else if is("hyprland") || std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some() {
+        println!("  Start olsvr from your Hyprland config instead:");
+        println!("      exec-once = olsvr run");
+    } else {
+        println!("  Starting your compositor through uwsm brings it up.");
+    }
 }
 
 /// Wrap the installed binary in a minimal `olsvr.app` whose `Info.plist` sets

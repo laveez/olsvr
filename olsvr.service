@@ -1,14 +1,18 @@
 [Unit]
 Description=OLED Screensaver
 After=graphical-session.target
+PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
-Type=simple
+Type=exec
 Environment=RUST_LOG=info
 UnsetEnvironment=DISPLAY XAUTHORITY
-ExecStart=%h/.cargo/bin/olsvr
+ExecStart="%h/.cargo/bin/olsvr" run
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=3 4
 
 [Install]
 WantedBy=graphical-session.target

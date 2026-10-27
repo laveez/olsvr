@@ -1286,7 +1286,7 @@ fn vulkan_instance() -> wgpu::Instance {
 /// A dispatch error means the compositor connection is gone: a logout, a compositor crash, or
 /// the compositor dropping olsvr. The process exits without dropping anything, since the
 /// swapchain's teardown would run against the dead connection.
-fn dispatch_or_exit(event_loop: &mut EventLoop<'_, App>, timeout: Duration, app: &mut App) {
+fn dispatch_or_exit(event_loop: &mut EventLoop<'_, App>, timeout: Option<Duration>, app: &mut App) {
     if let Err(e) = event_loop.dispatch(timeout, app) {
         log::error!("Event loop dispatch failed, exiting: {e}");
         pidfile::remove_if_ours(&pidfile::path());
@@ -1437,7 +1437,7 @@ pub fn run(args: RunArgs) {
         })
         .expect("Failed to insert signal source");
 
-    dispatch_or_exit(&mut event_loop, Duration::from_millis(100), &mut app);
+    dispatch_or_exit(&mut event_loop, Some(Duration::from_millis(100)), &mut app);
 
     // SCTK calls `new_seat` only for seats announced after the registry's first roundtrip.
     if app.seat.is_none() {
@@ -1496,8 +1496,14 @@ pub fn run(args: RunArgs) {
     while app.running {
         let had_compositor = has_compositor(&app);
         let t0 = Instant::now();
-        dispatch_or_exit(&mut event_loop, Duration::from_millis(16), &mut app);
-        let dispatch_ms = t0.elapsed().as_millis();
+        // While dormant every change arrives through an event source, so sleep until one fires.
+        // A pending activation (a preview, or a SIGUSR1 the startup dispatch consumed) must not
+        // wait for an unrelated event.
+        let busy = app.screensaver.is_some() || app.signal_activate || preview;
+        let timeout = busy.then_some(Duration::from_millis(16));
+        dispatch_or_exit(&mut event_loop, timeout, &mut app);
+        // A dormant sleep is not a stall.
+        let dispatch_ms = timeout.map_or(0, |_| t0.elapsed().as_millis());
         // The dispatch that creates the compositor builds the GPU device, so every show takes
         // that long and it is not a stall.
         let first_frame = !had_compositor && has_compositor(&app);

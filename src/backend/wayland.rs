@@ -19,6 +19,7 @@ use smithay_client_toolkit::{
         signals::{Signal, Signals},
     },
     reexports::calloop_wayland_source::WaylandSource,
+    reexports::csd_frame::WindowState,
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
@@ -606,12 +607,26 @@ fn dbus_idle_monitor_loop(
     }
 }
 
+/// Draws repeat this often until the first present of a show starts the frame callbacks.
+const BOOTSTRAP_RETRY: Duration = Duration::from_millis(100);
+/// A frame callback this late means the compositor is not showing the surface, as when the
+/// monitors are blanked, so drawing slows to `STALLED_RETRY` until the callback comes.
+const FRAME_CALLBACK_TIMEOUT: Duration = Duration::from_secs(1);
+const STALLED_RETRY: Duration = Duration::from_secs(2);
+
 struct Screensaver {
     /// Before `window`, which must outlive the wgpu Surface that draws to its wl_surface.
     compositor: Option<Compositor>,
     window: Window,
     inhibitor: Option<ZwpIdleInhibitorV1>,
     activated_at: Instant,
+    /// Set while the one frame callback is in flight, to when the next draw is due without it.
+    /// A compositor that is not showing the surface keeps every callback and sends them in one
+    /// burst once it shows it again, which after a long absence overflows mutter's client buffer
+    /// and disconnects olsvr.
+    frame_pending: Option<Instant>,
+    suspended: bool,
+    presented: bool,
 }
 
 struct App {
@@ -696,6 +711,9 @@ impl App {
             compositor: None,
             inhibitor,
             activated_at: Instant::now(),
+            frame_pending: None,
+            suspended: false,
+            presented: false,
         });
     }
 
@@ -783,7 +801,23 @@ impl App {
         }
     }
 
-    fn draw(&mut self, from_callback: bool) -> FrameOutcome {
+    fn draw_due(&self) -> bool {
+        let Some(ss) = &self.screensaver else {
+            return false;
+        };
+        match ss.frame_pending {
+            // A suspended surface draws only on frame callbacks once it has presented; until then
+            // the bootstrap retry runs, as a compositor may not unsuspend a surface it never saw
+            // mapped.
+            Some(_) if ss.suspended && ss.presented => false,
+            Some(due) => Instant::now() >= due,
+            None => {
+                self.ready_to_draw || self.last_draw.is_none_or(|t| t.elapsed() > BOOTSTRAP_RETRY)
+            }
+        }
+    }
+
+    fn draw(&mut self, from_callback: bool, qh: &QueueHandle<Self>) -> FrameOutcome {
         let debug_info = if self.debug {
             let frame_ms = self
                 .last_draw
@@ -804,13 +838,35 @@ impl App {
         };
         self.frame_count += 1;
 
-        if let Some(ref mut ss) = self.screensaver
-            && let Some(ref mut comp) = ss.compositor
-        {
-            comp.render_frame(debug_info.as_ref())
-        } else {
-            FrameOutcome::Skipped
+        let Some(ss) = &mut self.screensaver else {
+            return FrameOutcome::Skipped;
+        };
+        let Some(comp) = &mut ss.compositor else {
+            return FrameOutcome::Skipped;
+        };
+        let surface = ss.window.wl_surface();
+        let request = ss.frame_pending.is_none();
+        if request {
+            // Double-buffered like the rest of the surface state, so the commit inside the
+            // present carries it.
+            surface.frame(qh, surface.clone());
         }
+        let outcome = comp.render_frame(debug_info.as_ref());
+        if outcome == FrameOutcome::Presented {
+            ss.presented = true;
+        }
+        if request && outcome == FrameOutcome::Skipped {
+            surface.commit();
+        }
+        let wait = if !ss.presented {
+            BOOTSTRAP_RETRY
+        } else if request {
+            FRAME_CALLBACK_TIMEOUT
+        } else {
+            STALLED_RETRY
+        };
+        ss.frame_pending = Some(Instant::now() + wait);
+        outcome
     }
 }
 
@@ -837,11 +893,17 @@ impl CompositorHandler for App {
         &mut self,
         _conn: &Connection,
         _qh: &QueueHandle<Self>,
-        _surface: &wl_surface::WlSurface,
+        surface: &wl_surface::WlSurface,
         _time: u32,
     ) {
         log::debug!("Frame callback received");
-        self.ready_to_draw = true;
+        // A callback requested on the previous show's surface can still arrive.
+        if let Some(ss) = &mut self.screensaver
+            && ss.window.wl_surface() == surface
+        {
+            ss.frame_pending = None;
+            self.ready_to_draw = true;
+        }
     }
 
     fn surface_enter(
@@ -997,6 +1059,7 @@ impl WindowHandler for App {
         );
 
         if let Some(ref mut ss) = self.screensaver {
+            ss.suspended = configure.state.contains(WindowState::SUSPENDED);
             if w == 0 || h == 0 {
                 return;
             }
@@ -1463,34 +1526,13 @@ pub fn run(args: RunArgs) {
             break;
         }
 
-        // Draw when the compositor signals readiness (frame callback), or
-        // after 100ms as a fallback if the callback chain breaks.
-        let should_draw = app.screensaver.is_some()
-            && (app.ready_to_draw
-                || app
-                    .last_draw
-                    .is_none_or(|t| t.elapsed() > std::time::Duration::from_millis(100)));
-        if should_draw {
+        if app.draw_due() {
             let from_callback = app.ready_to_draw;
-            let surface = app
-                .screensaver
-                .as_ref()
-                .unwrap()
-                .window
-                .wl_surface()
-                .clone();
             let t1 = Instant::now();
-            let outcome = app.draw(from_callback);
+            let outcome = app.draw(from_callback, &qh);
             let draw_ms = t1.elapsed().as_millis();
-            match outcome {
-                FrameOutcome::Presented => {
-                    surface.frame(&qh, surface.clone());
-                    surface.damage_buffer(0, 0, i32::MAX, i32::MAX);
-                    surface.commit();
-                }
-                // No frame callback is requested, so the 100ms fallback retries.
-                FrameOutcome::Skipped => {}
-                FrameOutcome::Broken => app.hide_without_input(BackendEvent::ShowFailed, &qh),
+            if outcome == FrameOutcome::Broken {
+                app.hide_without_input(BackendEvent::ShowFailed, &qh);
             }
 
             if !first_frame

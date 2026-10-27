@@ -629,11 +629,16 @@ struct Screensaver {
     presented: bool,
 }
 
+/// How long activations stay off after a failed GPU init.
+const GPU_RETRY_PAUSE: Duration = Duration::from_secs(10 * 60);
+
 struct App {
     /// One instance per process, created at startup: a new instance loads the Vulkan drivers
     /// from disk, and after an NVIDIA update that has not been rebooted into, the new driver
     /// no longer matches the loaded kernel module. `None` from a failed show until the next.
     gpu_instance: Option<wgpu::Instance>,
+    /// When the last show failed to initialise the GPU.
+    gpu_failed_at: Option<Instant>,
     registry_state: RegistryState,
     compositor_state: CompositorState,
     output_state: OutputState,
@@ -770,7 +775,30 @@ impl App {
         }
     }
 
+    /// How much of the pause after a failed GPU init is left.
+    fn gpu_pause_left(&self) -> Option<Duration> {
+        GPU_RETRY_PAUSE.checked_sub(self.gpu_failed_at?.elapsed())
+    }
+
     fn on_event(&mut self, ev: BackendEvent, qh: &QueueHandle<Self>) {
+        if matches!(ev, BackendEvent::Idle | BackendEvent::ActivateSignal)
+            && let Some(left) = self.gpu_pause_left()
+        {
+            log::info!(
+                "GPU init failed recently, not activating for another {}s",
+                left.as_secs()
+            );
+            // Each idle source reports an idle period once; re-armed, it reports another one
+            // timeout later, so the pause ends in an activation instead of waiting for the
+            // user to come and go.
+            if self.idle_notification.is_some() {
+                self.arm_idle_notification(qh);
+            }
+            if let Some(gnome) = &self.gnome {
+                gnome.rearm();
+            }
+            return;
+        }
         let cmds = self.engine.handle(ev.clone(), Instant::now());
         if cmds.contains(&EngineCommand::Hide) {
             log::info!("Hide via {ev:?}");
@@ -1082,6 +1110,11 @@ impl WindowHandler for App {
                     // A GPU reset can leave the instance itself unusable, so the next show
                     // starts from a fresh one.
                     self.gpu_instance = None;
+                    self.gpu_failed_at = Some(Instant::now());
+                    log::warn!(
+                        "GPU init failed, not activating for the next {} min",
+                        GPU_RETRY_PAUSE.as_secs() / 60
+                    );
                     self.hide_without_input(BackendEvent::ShowFailed, qh);
                 }
             } else if let Some(ref mut comp) = ss.compositor {
@@ -1386,6 +1419,7 @@ pub fn run(args: RunArgs) {
 
     let mut app = App {
         gpu_instance: Some(vulkan_instance()),
+        gpu_failed_at: None,
         registry_state: RegistryState::new(&globals),
         compositor_state,
         output_state: OutputState::new(&globals, &qh),

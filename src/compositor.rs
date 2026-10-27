@@ -90,6 +90,40 @@ pub(crate) fn warning_due(last: &mut Option<Instant>) -> bool {
     true
 }
 
+fn log_adapter(info: &wgpu::AdapterInfo) {
+    log::info!(
+        "GPU adapter: {} [{}, {:?}], driver {} {}",
+        info.name,
+        info.backend,
+        info.device_type,
+        info.driver,
+        info.driver_info
+    );
+    #[cfg(target_os = "linux")]
+    report_driver_change(info);
+}
+
+/// After an NVIDIA update that has not been rebooted into, the kernel module rejects the new
+/// userspace driver and the Vulkan loader falls back to the next adapter it finds. A show on
+/// the CPU, or on another adapter than the first show's, is reported once.
+#[cfg(target_os = "linux")]
+fn report_driver_change(info: &wgpu::AdapterInfo) {
+    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    static FIRST: OnceLock<wgpu::AdapterInfo> = OnceLock::new();
+    static REPORTED: AtomicBool = AtomicBool::new(false);
+
+    let first = FIRST.get_or_init(|| info.clone());
+    let changed = (first.vendor, first.device, first.backend, first.device_type)
+        != (info.vendor, info.device, info.backend, info.device_type);
+    if (changed || info.device_type == wgpu::DeviceType::Cpu)
+        && !REPORTED.swap(true, Ordering::Relaxed)
+    {
+        log::error!("GPU driver changed since login, reboot to restore GPU rendering");
+    }
+}
+
 impl Compositor {
     /// Build the renderer from a platform-created surface and the `wgpu::Instance`
     /// it was made from. The backend owns surface creation (Wayland raw handle on
@@ -116,6 +150,7 @@ impl Compositor {
                     return None;
                 }
             };
+        log_adapter(&adapter.get_info());
 
         let device_queue = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
             label: Some("olsvr"),
@@ -139,7 +174,11 @@ impl Compositor {
         let (width, height) = clamp_to_max(width, height, max_texture_dim);
 
         let caps = surface.get_capabilities(&adapter);
-        let format = caps.formats[0];
+        let (Some(&format), Some(&alpha_mode)) = (caps.formats.first(), caps.alpha_modes.first())
+        else {
+            log::error!("The GPU adapter reports no surface format or alpha mode for this surface");
+            return None;
+        };
 
         let present_mode = if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
             log::info!("Using Mailbox present mode (non-blocking)");
@@ -156,7 +195,7 @@ impl Compositor {
             width,
             height,
             present_mode,
-            alpha_mode: caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };

@@ -267,7 +267,7 @@ fn wizard() -> bool {
 }
 
 /// Shows the preview with the autostart service stopped, and starts the service again after.
-/// `false` when the service does not come back.
+/// `false` when the service does not come back; skipped when it could not come back.
 fn run_preview() -> bool {
     if !preview_possible() {
         return true;
@@ -755,7 +755,7 @@ fn preview_possible() -> bool {
     if Path::new(&plist_path).exists() || !autostart_active() {
         return true;
     }
-    println!("  No preview: {plist_path} is missing, so setup could not load the agent again.");
+    println!("  No preview: {plist_path} is missing, so setup cannot load the agent after it.");
     println!("  To install it again, answer Yes at the autostart step.");
     false
 }

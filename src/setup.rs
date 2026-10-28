@@ -94,8 +94,9 @@ fn start_autostart_service() -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    // Older macOS without `bootstrap`: fall back to legacy load.
-    if launchctl(&["load", "-w", &plist_path]).is_ok() {
+    // Older macOS without `bootstrap`: fall back to legacy load. It exits 0 even when it loads
+    // nothing (`man launchctl`), so only a job that is loaded afterwards counts.
+    if launchctl(&["load", "-w", &plist_path]).is_ok() && autostart_active() {
         return true;
     }
     eprintln!("  launchctl bootstrap failed: {failure}");

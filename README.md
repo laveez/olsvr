@@ -52,7 +52,7 @@ olsvr prevents OLED burn-in by displaying a fading clock that periodically repos
 Install the latest release, then run the setup wizard. Building needs Rust 1.89 or newer and, on Linux, a few system packages: see [Requirements](#requirements).
 
 ```bash
-cargo install --locked --git https://github.com/laveez/olsvr --tag v0.3.1
+cargo install --locked --git https://github.com/laveez/olsvr --tag v0.3.2
 olsvr setup
 ```
 

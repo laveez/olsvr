@@ -1714,7 +1714,7 @@ dependencies = [
 
 [[package]]
 name = "olsvr"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "calloop 0.14.5",
  "chrono",

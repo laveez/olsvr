@@ -289,8 +289,8 @@ fn run_preview() -> bool {
 
 fn show_preview() {
     let exe = std::env::current_exe().unwrap_or_else(|_| "olsvr".into());
-    let mut child = match Command::new(exe).args(["run", "--now"]).spawn() {
-        Ok(child) => child,
+    let _preview = match Command::new(exe).args(["run", "--now"]).spawn() {
+        Ok(child) => Preview(child),
         Err(e) => {
             eprintln!("  Cannot start the preview: {e}");
             return;
@@ -299,8 +299,18 @@ fn show_preview() {
     println!("  Preview running. Press Enter here to end the preview.");
     println!();
     let _ = std::io::stdin().read_line(&mut String::new());
-    let _ = child.kill();
-    let _ = child.wait();
+}
+
+/// The running preview, stopped when this drops. That includes the unwind from a print to a
+/// terminal that closed before the preview started: the hangup then never reached the preview,
+/// which would outlive setup.
+struct Preview(std::process::Child);
+
+impl Drop for Preview {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 extern "C" fn ignore_signal(_: libc::c_int) {}

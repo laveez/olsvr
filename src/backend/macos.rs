@@ -343,6 +343,13 @@ fn configure_saver_window(window: &Window, monitor: &MonitorHandle) -> Option<Ph
 /// How often to poll the idle timer while waiting.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Set by SIGTERM and SIGINT, and read by `about_to_wait`, which ends the event loop on it.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn request_shutdown(_: libc::c_int) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Relaxed);
+}
+
 /// While the saver is showing, a system idle time below this means fresh user
 /// input, so dismiss. Only a best-effort fallback: the counter trails input by up
 /// to a second, so its first reading after input is often already above this, and
@@ -448,6 +455,13 @@ pub fn run(args: RunArgs) {
 
     let mut config = Config::load();
     crate::merge_cli(&mut config, &args);
+
+    // Without a handler, `olsvr stop`, a launchd bootout or restart, and Ctrl-C would end the
+    // process on the spot, leaving the PID file behind. The handler only sets a flag, which the
+    // event loop reads at least once per POLL_INTERVAL.
+    for signal in [libc::SIGTERM, libc::SIGINT] {
+        unsafe { libc::signal(signal, request_shutdown as *const () as libc::sighandler_t) };
+    }
 
     let _pid_lock = if args.now {
         None
@@ -813,6 +827,15 @@ impl ApplicationHandler for MacApp {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // winit keeps calling this until NSApplication has stopped
+        if event_loop.exiting() {
+            return;
+        }
+        if SHUTDOWN_REQUESTED.load(Ordering::Relaxed) {
+            log::info!("Received shutdown signal");
+            event_loop.exit();
+            return;
+        }
         let poll_due = self.last_poll.elapsed() >= POLL_INTERVAL;
         if poll_due {
             self.last_poll = Instant::now();
@@ -921,5 +944,8 @@ impl ApplicationHandler for MacApp {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         log::warn!("Event loop exiting");
+        // A quit event, such as Activity Monitor's Quit, ends the process in `exit` right after
+        // this, so the PID lock is never dropped.
+        pidfile::remove_if_ours(&pidfile::path());
     }
 }

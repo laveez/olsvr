@@ -9,6 +9,13 @@ use serde::de::DeserializeOwned;
 use crate::config::{Config, MIN_WEATHER_INTERVAL};
 use crate::pidfile::{self, StopOutcome};
 
+/// `eprintln!` for what starting the autostart service prints. That also runs in
+/// `StoppedAutostart`'s drop while setup unwinds from a print to a closed terminal, where a second
+/// panic from `eprintln!` would abort the process.
+fn report(message: std::fmt::Arguments) {
+    let _ = writeln!(std::io::stderr(), "{message}");
+}
+
 /// An instance that still holds the PID lock would show its own saver in place of the preview
 /// (Linux) or refuse the preview (macOS). `false` when it does not stop.
 fn stop_running_instance(autostart_was_active: bool) -> bool {
@@ -74,7 +81,7 @@ fn start_autostart_service() -> bool {
     if systemctl_user(&["start", "olsvr.service"]) {
         return true;
     }
-    eprintln!("  The service is stopped.");
+    report(format_args!("  The service is stopped."));
     false
 }
 
@@ -98,10 +105,10 @@ fn start_autostart_service() -> bool {
     if launchctl(&["load", "-w", &plist_path]).is_ok() {
         return true;
     }
-    eprintln!("  launchctl bootstrap failed: {failure}");
-    eprintln!(
+    report(format_args!("  launchctl bootstrap failed: {failure}"));
+    report(format_args!(
         "  The login agent is not loaded. Load it with: launchctl bootstrap {domain} {plist_path}"
-    );
+    ));
     false
 }
 
@@ -113,7 +120,10 @@ fn systemctl_user(args: &[&str]) -> bool {
         Ok(status) => status.to_string(),
         Err(e) => e.to_string(),
     };
-    eprintln!("  systemctl --user {} failed: {failure}", args.join(" "));
+    report(format_args!(
+        "  systemctl --user {} failed: {failure}",
+        args.join(" ")
+    ));
     false
 }
 

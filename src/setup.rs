@@ -101,8 +101,9 @@ fn start_autostart_service() -> bool {
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
-    // Older macOS without `bootstrap`: fall back to legacy load. It exits 0 even when it loads
-    // nothing (`man launchctl`), so only a job that is loaded afterwards counts.
+    // `bootstrap` also fails for a job disabled with `launchctl disable`, which legacy load with
+    // -w enables and loads. Load exits 0 even when it loads nothing (`man launchctl`), so only a
+    // job that is loaded afterwards counts.
     if launchctl(&["load", "-w", &plist_path]).is_ok() && autostart_active() {
         return true;
     }
@@ -132,7 +133,13 @@ fn systemctl_user(args: &[&str]) -> bool {
 fn launchctl(args: &[&str]) -> Result<(), String> {
     match Command::new("launchctl").args(args).output() {
         Ok(output) if output.status.success() => Ok(()),
-        Ok(output) => Err(String::from_utf8_lossy(&output.stderr).trim().to_owned()),
+        // A failed bootstrap adds a second line suggesting root, which never helps a login agent
+        Ok(output) => Err(String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .trim()
+            .to_owned()),
         Err(e) => Err(e.to_string()),
     }
 }

@@ -747,10 +747,32 @@ fn refresh_autostart() -> bool {
         return report_autostart_state();
     }
     println!("  Restarting autostart to apply the new config.");
-    if !restart_autostart() || !report_service_state() {
+    if !restart_with_saved_config() || !report_service_state() {
         return false;
     }
     println!("  Autostart is running with the new config.");
+    true
+}
+
+#[cfg(target_os = "linux")]
+fn restart_with_saved_config() -> bool {
+    restart_autostart()
+}
+
+/// `restart_autostart` loads the agent again from its plist, so without the plist the agent would
+/// stay unloaded. launchd still holds the loaded job, and kickstart restarts it from that.
+#[cfg(target_os = "macos")]
+fn restart_with_saved_config() -> bool {
+    let plist_path = launchd_plist_path();
+    if Path::new(&plist_path).exists() {
+        return restart_autostart();
+    }
+    println!("  {plist_path} is gone, so the agent does not start at the next login.");
+    println!("  To install it again, run olsvr setup and answer Yes at the autostart step.");
+    if let Err(e) = launchctl(&["kickstart", "-k", &launchd_target()]) {
+        eprintln!("  launchctl kickstart failed: {e}");
+        return false;
+    }
     true
 }
 

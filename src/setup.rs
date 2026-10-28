@@ -269,6 +269,9 @@ fn wizard() -> bool {
 /// Shows the preview with the autostart service stopped, and starts the service again after.
 /// `false` when the service does not come back.
 fn run_preview() -> bool {
+    if !preview_possible() {
+        return true;
+    }
     let _interrupts = IgnoreInterrupts::new();
     let stopped = StoppedAutostart::stop();
     if stop_running_instance(stopped.was_active) {
@@ -739,6 +742,24 @@ fn restart_with_saved_config() -> bool {
     restart_autostart()
 }
 
+#[cfg(target_os = "linux")]
+fn preview_possible() -> bool {
+    true
+}
+
+/// The preview unloads a running agent and loads it again from its plist, so it is skipped while
+/// the agent is loaded and its plist is missing.
+#[cfg(target_os = "macos")]
+fn preview_possible() -> bool {
+    let plist_path = launchd_plist_path();
+    if Path::new(&plist_path).exists() || !autostart_active() {
+        return true;
+    }
+    println!("  No preview: {plist_path} is missing, so setup could not load the agent again.");
+    println!("  To install it again, answer Yes at the autostart step.");
+    false
+}
+
 /// `restart_autostart` loads the agent again from its plist, so without the plist the agent would
 /// stay unloaded. launchd still holds the loaded job, and kickstart restarts it from that.
 #[cfg(target_os = "macos")]
@@ -747,7 +768,7 @@ fn restart_with_saved_config() -> bool {
     if Path::new(&plist_path).exists() {
         return restart_autostart();
     }
-    println!("  {plist_path} is gone, so the agent does not start at the next login.");
+    println!("  {plist_path} is missing, so the agent does not start at the next login.");
     println!("  To install it again, run olsvr setup and answer Yes at the autostart step.");
     if let Err(e) = launchctl(&["kickstart", "-k", &launchd_target()]) {
         eprintln!("  launchctl kickstart failed: {e}");

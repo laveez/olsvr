@@ -553,7 +553,8 @@ struct MacApp {
     /// Consecutive failed show attempts, for log throttling.
     show_failures: u32,
     /// The PID and name of the app found holding a display-sleep assertion when the current
-    /// hold started; cleared by the first idle check that no longer finds one. The name is
+    /// hold started; cleared by the first idle check that no longer finds one, and by input,
+    /// so each idle period names its holder once. The name is
     /// looked up at the start, because the process may be gone when the hold ends. Kept so
     /// the log shows when a hold starts and ends rather than every poll.
     display_inhibitor: Option<(i32, String)>,
@@ -855,6 +856,9 @@ impl ApplicationHandler for MacApp {
         // Drive the Engine from the system-wide idle timer: activation, and a
         // best-effort dismiss for input the saver windows did not receive.
         let idle = idle_seconds();
+        if idle < self.timeout.as_secs_f64() {
+            self.display_inhibitor = None;
+        }
         let showing = !self.targets.is_empty();
         if !showing
             && !self.locked

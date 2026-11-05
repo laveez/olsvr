@@ -368,9 +368,9 @@ struct IdleMonitor {
     failures: u32,
     next_poll: Instant,
     gate_warned_at: Option<Instant>,
-    /// `[activation] ignore_inhibitors`.
     ignored_inhibitors: Vec<String>,
-    /// The app id of the inhibitor that kept the last idle check from activating.
+    /// The app id of the inhibitor that kept an idle check from activating. Cleared by input, so
+    /// each idle period names its blocker once.
     inhibited_by: Option<String>,
 }
 
@@ -520,6 +520,9 @@ impl IdleMonitor {
         let Some(idle_ms) = idle_ms else {
             return Ok(());
         };
+        if idle_ms < self.timeout_ms {
+            self.inhibited_by = None;
+        }
         if !self.was_idle && idle_ms >= self.timeout_ms && self.activation_allowed(&session) {
             log::info!("D-Bus: user idle ({idle_ms}ms) — activating screensaver");
             self.send(DbusIdleEvent::Idle)?;

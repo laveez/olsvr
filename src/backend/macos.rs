@@ -188,7 +188,7 @@ pub(crate) fn process_name(pid: i32) -> String {
 
 /// The PID that owns the first display-sleep assertion another app holds, e.g. a video
 /// player or presentation keeping the screen on. The macOS analog of the Wayland inhibitor
-/// gate (`idle_inhibited_by_others`), so the saver doesn't cover playing video. Our own
+/// gate (`idle_inhibitor_of_others`), so the saver doesn't cover playing video. Our own
 /// keep-awake assertion (held under some `keep_awake` policies) is ignored by owning PID
 /// and by name, so a second olsvr instance doesn't count either. So are the assertions of
 /// the processes `ignored` names.
@@ -474,6 +474,10 @@ pub fn run(args: RunArgs) {
     };
 
     let timeout = Duration::from_secs(config.timeout as u64 * 60);
+    let ignored = &config.activation.ignore_inhibitors;
+    if !ignored.is_empty() {
+        log::info!("Ignoring the display-sleep assertions of {ignored:?}");
+    }
     let engine = Engine::new(config.activation.clone(), vec![0]);
 
     // Watchdog guards against a trapped screen if the render loop ever stalls.
@@ -776,12 +780,13 @@ impl MacApp {
     }
 
     /// Whether another app's display-sleep assertion should keep the saver away. Logs
-    /// when a hold starts and ends. Only the idle check calls it, so an end is logged
-    /// at the first idle check after the hold is gone, not when it is released.
+    /// when a hold starts, passes to another app, and ends. Only the idle check calls it,
+    /// so an end is logged at the first idle check after the hold is gone, not when it is
+    /// released.
     fn display_inhibited(&mut self) -> bool {
         let ignored = &self.config.activation.ignore_inhibitors;
         match (&self.display_inhibitor, display_sleep_inhibited(ignored)) {
-            (None, Some(pid)) => {
+            (held, Some(pid)) if held.as_ref().is_none_or(|(held_pid, _)| *held_pid != pid) => {
                 let app = process_name(pid);
                 log::info!(
                     "Not activating while {app:?} (pid {pid}) holds a display-sleep assertion"

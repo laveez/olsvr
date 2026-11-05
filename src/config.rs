@@ -173,6 +173,14 @@ impl Config {
             ));
             self.date_format = defaults.date_format;
         }
+        for name in std::mem::take(&mut self.activation.ignore_inhibitors) {
+            match name.trim() {
+                "" => problems.push(format!(
+                    "ignore_inhibitors entry {name:?} names no app, dropping it"
+                )),
+                trimmed => self.activation.ignore_inhibitors.push(trimmed.to_string()),
+            }
+        }
         for (i, table) in self.layers.iter_mut().flatten().enumerate() {
             table.retain(|key, value| match broken_layer_rule(key, value) {
                 Some(rule) => {

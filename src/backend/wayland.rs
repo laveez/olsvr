@@ -254,25 +254,26 @@ fn gnome_session_running() -> bool {
     owned.is_ok_and(|(owned,)| owned)
 }
 
-/// The app id and reason of the first gnome-session idle inhibitor that an app other than olsvr
-/// holds and `ignored` does not name. Inhibitors relayed by mutter count, under the app id
+/// The app id and object path of the first gnome-session idle inhibitor that an app other than
+/// olsvr holds and `ignored` does not name. Inhibitors relayed by mutter count, under the app id
 /// `mutter`: mpv and SDL inhibit through that relay, and olsvr's own relayed inhibitor exists
 /// only while the saver shows, when activation is moot. No session manager on the bus counts as
 /// not inhibited.
 fn idle_inhibitor_of_others(
     session: &dbus::blocking::Proxy<&dbus::blocking::Connection>,
     ignored: &[String],
-) -> Result<Option<(String, String)>, dbus::Error> {
+) -> Result<Option<(String, dbus::Path<'static>)>, dbus::Error> {
     const NO_SESSION_MANAGER: [&str; 2] = [
         "org.freedesktop.DBus.Error.ServiceUnknown",
         "org.freedesktop.DBus.Error.NameHasNoOwner",
     ];
     let conn = session.connection;
-    let find_other = || -> Result<Option<(String, String)>, dbus::Error> {
+    let find_other = || -> Result<Option<(String, dbus::Path<'static>)>, dbus::Error> {
         let (paths,): (Vec<dbus::Path<'static>>,) =
             session.method_call("org.gnome.SessionManager", "GetInhibitors", ())?;
         for path in paths {
-            let inhibitor = conn.with_proxy("org.gnome.SessionManager", path, session.timeout);
+            let inhibitor =
+                conn.with_proxy("org.gnome.SessionManager", path.clone(), session.timeout);
             let (flags,): (u32,) =
                 inhibitor.method_call("org.gnome.SessionManager.Inhibitor", "GetFlags", ())?;
             if flags & IDLE_INHIBIT_FLAG == 0 {
@@ -283,9 +284,7 @@ fn idle_inhibitor_of_others(
             if app_id == INHIBIT_APP_ID || inhibitor_ignored(ignored, &app_id) {
                 continue;
             }
-            let (reason,): (String,) =
-                inhibitor.method_call("org.gnome.SessionManager.Inhibitor", "GetReason", ())?;
-            return Ok(Some((app_id, reason)));
+            return Ok(Some((app_id, path)));
         }
         Ok(None)
     };
@@ -552,8 +551,21 @@ impl IdleMonitor {
                 }
                 true
             }
-            Ok(Some((app, reason))) => {
+            Ok(Some((app, path))) => {
                 if self.inhibited_by.as_ref() != Some(&app) {
+                    // Read only for the log line, so an inhibitor gone by now still blocks this
+                    // check instead of failing it.
+                    let inhibitor = session.connection.with_proxy(
+                        "org.gnome.SessionManager",
+                        path,
+                        session.timeout,
+                    );
+                    let reason: Result<(String,), dbus::Error> = inhibitor.method_call(
+                        "org.gnome.SessionManager.Inhibitor",
+                        "GetReason",
+                        (),
+                    );
+                    let reason = reason.map_or_else(|_| "?".to_string(), |(reason,)| reason);
                     log::info!(
                         "D-Bus: not activating while {app:?} holds an idle inhibitor ({reason:?})"
                     );
@@ -1515,6 +1527,12 @@ pub fn run(args: RunArgs) {
     // until it answers. Beside ext-idle it runs only on GNOME, for the lock screen and
     // keep_awake = "always".
     let poll_idle = app.idle_notification.is_none();
+    let ignored = app.config.activation.ignore_inhibitors.clone();
+    if !poll_idle && !ignored.is_empty() {
+        log::warn!(
+            "Config: ignore_inhibitors has no effect with ext-idle-notify, where the compositor applies idle inhibitors itself"
+        );
+    }
     if poll_idle || gnome_session_running() {
         let timeout_ms = app.config.timeout as u64 * 60 * 1000;
         let stopped = if poll_idle {
@@ -1524,7 +1542,6 @@ pub fn run(args: RunArgs) {
             log::info!("GNOME session found, watching its lock screen over D-Bus");
             "the GNOME lock screen goes unwatched"
         };
-        let ignored = app.config.activation.ignore_inhibitors.clone();
         if poll_idle && !ignored.is_empty() {
             log::info!("Ignoring the idle inhibitors of {ignored:?}");
         }

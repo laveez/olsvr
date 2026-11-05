@@ -35,11 +35,15 @@ pub enum KeepAwake {
 }
 
 /// Activation + keep-awake policy, configured via the `[activation]` table.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Activation {
     pub displays: DisplayScope,
     pub keep_awake: KeepAwake,
+    /// Apps whose idle inhibitors (GNOME) or display-sleep assertions (macOS) do not keep the
+    /// saver away. Left out of a saved file while empty, so setup leaves older files unchanged.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub ignore_inhibitors: Vec<String>,
 }
 
 impl Default for Activation {
@@ -47,8 +51,21 @@ impl Default for Activation {
         Self {
             displays: DisplayScope::Primary,
             keep_awake: KeepAwake::WhileActive,
+            ignore_inhibitors: Vec::new(),
         }
     }
+}
+
+/// Whether `ignored` names `app`: a GNOME inhibitor's app id, often a path that carries a
+/// version (`/snap/discord/320/usr/share/discord/Discord`), or a macOS process name. A name
+/// matches the whole id or its last path segment, ignoring case.
+pub fn inhibitor_ignored(ignored: &[String], app: &str) -> bool {
+    let app = app.to_lowercase();
+    let last = app.rsplit('/').next().unwrap_or(&app);
+    ignored.iter().any(|name| {
+        let name = name.to_lowercase();
+        name == app || name == last
+    })
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

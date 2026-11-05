@@ -48,7 +48,7 @@ use wayland_protocols::wp::idle_inhibit::zv1::client::{
 use smithay_client_toolkit::reexports::calloop::channel::{self, Sender};
 
 use crate::compositor::{Compositor, DebugInfo, FrameOutcome, warning_due};
-use crate::config::{Config, KeepAwake};
+use crate::config::{Config, KeepAwake, inhibitor_ignored};
 use crate::data::{self, DataCache};
 use crate::engine::{BackendEvent, Engine, EngineCommand};
 use crate::{EXIT_NO_COMPOSITOR, RunArgs, merge_cli, pidfile};
@@ -95,12 +95,24 @@ struct GnomeSession {
 }
 
 impl GnomeSession {
-    fn spawn(events: Sender<DbusIdleEvent>, timeout_ms: u64, poll_idle: bool) -> Self {
+    fn spawn(
+        events: Sender<DbusIdleEvent>,
+        timeout_ms: u64,
+        poll_idle: bool,
+        ignored_inhibitors: Vec<String>,
+    ) -> Self {
         let (tx, commands) = mpsc::channel();
         let locked = Arc::new(AtomicBool::new(false));
         let thread_locked = Arc::clone(&locked);
         std::thread::spawn(move || {
-            dbus_idle_monitor_loop(events, commands, thread_locked, timeout_ms, poll_idle)
+            dbus_idle_monitor_loop(
+                events,
+                commands,
+                thread_locked,
+                timeout_ms,
+                poll_idle,
+                ignored_inhibitors,
+            )
         });
         Self { tx, locked }
     }
@@ -242,19 +254,21 @@ fn gnome_session_running() -> bool {
     owned.is_ok_and(|(owned,)| owned)
 }
 
-/// Whether an app other than olsvr holds a gnome-session idle inhibitor. Inhibitors relayed by
-/// mutter count: mpv and SDL inhibit through that relay, and olsvr's own relayed inhibitor exists
+/// The app id and reason of the first gnome-session idle inhibitor that an app other than olsvr
+/// holds and `ignored` does not name. Inhibitors relayed by mutter count, under the app id
+/// `mutter`: mpv and SDL inhibit through that relay, and olsvr's own relayed inhibitor exists
 /// only while the saver shows, when activation is moot. No session manager on the bus counts as
 /// not inhibited.
-fn idle_inhibited_by_others(
+fn idle_inhibitor_of_others(
     session: &dbus::blocking::Proxy<&dbus::blocking::Connection>,
-) -> Result<bool, dbus::Error> {
+    ignored: &[String],
+) -> Result<Option<(String, String)>, dbus::Error> {
     const NO_SESSION_MANAGER: [&str; 2] = [
         "org.freedesktop.DBus.Error.ServiceUnknown",
         "org.freedesktop.DBus.Error.NameHasNoOwner",
     ];
     let conn = session.connection;
-    let find_other = || -> Result<bool, dbus::Error> {
+    let find_other = || -> Result<Option<(String, String)>, dbus::Error> {
         let (paths,): (Vec<dbus::Path<'static>>,) =
             session.method_call("org.gnome.SessionManager", "GetInhibitors", ())?;
         for path in paths {
@@ -266,14 +280,17 @@ fn idle_inhibited_by_others(
             }
             let (app_id,): (String,) =
                 inhibitor.method_call("org.gnome.SessionManager.Inhibitor", "GetAppId", ())?;
-            if app_id != INHIBIT_APP_ID {
-                return Ok(true);
+            if app_id == INHIBIT_APP_ID || inhibitor_ignored(ignored, &app_id) {
+                continue;
             }
+            let (reason,): (String,) =
+                inhibitor.method_call("org.gnome.SessionManager.Inhibitor", "GetReason", ())?;
+            return Ok(Some((app_id, reason)));
         }
-        Ok(false)
+        Ok(None)
     };
     match find_other() {
-        Err(e) if e.name().is_some_and(|n| NO_SESSION_MANAGER.contains(&n)) => Ok(false),
+        Err(e) if e.name().is_some_and(|n| NO_SESSION_MANAGER.contains(&n)) => Ok(None),
         result => result,
     }
 }
@@ -352,6 +369,10 @@ struct IdleMonitor {
     failures: u32,
     next_poll: Instant,
     gate_warned_at: Option<Instant>,
+    /// `[activation] ignore_inhibitors`.
+    ignored_inhibitors: Vec<String>,
+    /// The app id of the inhibitor that kept the last idle check from activating.
+    inhibited_by: Option<String>,
 }
 
 impl Drop for IdleMonitor {
@@ -513,6 +534,8 @@ impl IdleMonitor {
     }
 
     /// Not within one timeout of a hide without input, and not while another app inhibits idle.
+    /// Logs when an inhibitor starts and stops keeping the saver away. Only the idle check calls
+    /// it, so an end is logged at the first idle check after the inhibitor is gone.
     fn activation_allowed(
         &mut self,
         session: &dbus::blocking::Proxy<&dbus::blocking::Connection>,
@@ -520,10 +543,22 @@ impl IdleMonitor {
         if self.activate_after.is_some_and(|t| Instant::now() < t) {
             return false;
         }
-        match idle_inhibited_by_others(session) {
-            Ok(false) => true,
-            Ok(true) => {
-                log::debug!("D-Bus: idle inhibited — skipping activation");
+        match idle_inhibitor_of_others(session, &self.ignored_inhibitors) {
+            Ok(None) => {
+                if let Some(app) = self.inhibited_by.take() {
+                    log::info!(
+                        "D-Bus: idle inhibitor of {app:?} no longer found, activation resumes"
+                    );
+                }
+                true
+            }
+            Ok(Some((app, reason))) => {
+                if self.inhibited_by.as_ref() != Some(&app) {
+                    log::info!(
+                        "D-Bus: not activating while {app:?} holds an idle inhibitor ({reason:?})"
+                    );
+                    self.inhibited_by = Some(app);
+                }
                 false
             }
             Err(e) => {
@@ -577,6 +612,7 @@ fn dbus_idle_monitor_loop(
     locked: Arc<AtomicBool>,
     timeout_ms: u64,
     poll_idle: bool,
+    ignored_inhibitors: Vec<String>,
 ) {
     let mut monitor = IdleMonitor {
         events,
@@ -593,6 +629,8 @@ fn dbus_idle_monitor_loop(
         failures: 0,
         next_poll: Instant::now(),
         gate_warned_at: None,
+        ignored_inhibitors,
+        inhibited_by: None,
     };
     loop {
         let conn = monitor.connect();
@@ -1394,7 +1432,7 @@ pub fn run(args: RunArgs) {
     // The Engine owns the activate/deactivate decisions and grace periods. On
     // Wayland a single fullscreen surface is used regardless of the display set,
     // so a one-element display list is sufficient.
-    let engine = Engine::new(config.activation, vec![0]);
+    let engine = Engine::new(config.activation.clone(), vec![0]);
 
     // Blocks these signals for this thread only, so it comes before the Vulkan instance below:
     // threads the drivers start inherit the mask, and a signal one of them took would kill
@@ -1486,8 +1524,12 @@ pub fn run(args: RunArgs) {
             log::info!("GNOME session found, watching its lock screen over D-Bus");
             "the GNOME lock screen goes unwatched"
         };
+        let ignored = app.config.activation.ignore_inhibitors.clone();
+        if poll_idle && !ignored.is_empty() {
+            log::info!("Ignoring the idle inhibitors of {ignored:?}");
+        }
         let (tx, rx) = channel::channel::<DbusIdleEvent>();
-        app.gnome = Some(GnomeSession::spawn(tx, timeout_ms, poll_idle));
+        app.gnome = Some(GnomeSession::spawn(tx, timeout_ms, poll_idle, ignored));
         event_loop
             .handle()
             .insert_source(rx, move |event, _, app: &mut App| {

@@ -222,6 +222,7 @@ The `[activation]` table sets which displays the saver covers and what it keeps 
 |---|---|---|
 | `displays` | `primary` (the main display only) or `all` (every connected display). `all` is macOS only: Wayland shows one window, on the output the compositor picks. | `primary` |
 | `keep_awake` | `while-active`, `always` or `off`; see [Keep-Awake and Locking](#keep-awake-and-locking) | `while-active` |
+| `ignore_inhibitors` | Apps whose idle inhibitors (GNOME) or display-sleep assertions (macOS) do not keep the saver away; see [Keep-Awake and Locking](#keep-awake-and-locking). Each name is the app the log names, or the last part of it after a `/`, in any case. No effect on sway, Hyprland and other compositors with ext-idle-notify. | `[]` |
 
 ### Example
 
@@ -249,6 +250,7 @@ icon_font = "MesloLGS NF"
 [activation]
 displays = "all"             # macOS; Wayland always shows one window
 keep_awake = "while-active"  # or "always" (macOS, GNOME) or "off"
+ignore_inhibitors = ["discord"]  # GNOME, macOS
 ```
 
 ### CLI flags
@@ -288,7 +290,7 @@ On Wayland, unless `keep_awake` is `off`, the saver's window carries an idle inh
 
 > **Security note:** with `while-active` (the default) or `always`, these locks wait while the saver shows, so the session stays unlocked until you return: GNOME's automatic screen lock, a lock that swayidle or hypridle would start, and on macOS a lock that follows display sleep. Under `always` they also wait while the saver is hidden, for as long as the session is unlocked (GNOME and macOS). Lock the screen yourself when you leave (Super+L on GNOME, Ctrl+Cmd+Q on macOS), or set `keep_awake = "off"` to let the desktop's idle lock run over the saver.
 
-**Other apps keep the saver away.** olsvr does not activate while another app holds idle off: a playing video, a call, or a keep-awake tool such as GNOME's Caffeine extension or `caffeinate -d` on macOS. On Wayland it respects other apps' idle inhibitors. On macOS it respects other apps' display-sleep assertions, including the ones Chrome and Firefox hold during video, and the log names the app that holds one.
+**Other apps keep the saver away.** olsvr does not activate while another app holds idle off: a playing video, a call, or a keep-awake tool such as GNOME's Caffeine extension or `caffeinate -d` on macOS. On Wayland it respects other apps' idle inhibitors; on GNOME the log names the app that holds one, and apps that inhibit through the Wayland protocol show as `mutter`. On macOS it respects other apps' display-sleep assertions, including the ones Chrome and Firefox hold during video, and the log names the app that holds one. Some apps hold one with nothing playing (Discord can, while its window is open); add such an app to `ignore_inhibitors` in `[activation]` and the saver shows over it.
 
 **GNOME's Blank Screen Delay.** olsvr's default `timeout` of 5 minutes equals GNOME's default Blank Screen Delay (Settings > Privacy & Security > Screen Lock, or the `idle-delay` key of `org.gnome.desktop.session`: 300 seconds). With equal values both fire at once, and GNOME may blank and lock the screen before the saver shows. Set `timeout` below GNOME's delay if you want the clock.
 
@@ -384,7 +386,7 @@ Afterwards, start the service or agent again with the commands under [Contributi
 **The saver does not show.**
 
 - `olsvr is already running (PID <pid>)`: another instance holds the PID file (`$XDG_RUNTIME_DIR/olsvr.pid` on Linux, `~/Library/Application Support/olsvr/olsvr.pid` on macOS); stop it with `olsvr stop`.
-- Another app holds idle off (see [Keep-Awake and Locking](#keep-awake-and-locking)). On macOS the log says `Not activating while "<app>" (pid <pid>) holds a display-sleep assertion`; on GNOME the skip is logged at debug level.
+- Another app holds idle off (see [Keep-Awake and Locking](#keep-awake-and-locking)). On macOS the log says `Not activating while "<app>" (pid <pid>) holds a display-sleep assertion`; on GNOME it says `D-Bus: not activating while "<app id>" holds an idle inhibitor ("<reason>")`. For an app that holds one with nothing playing, see `ignore_inhibitors` under [Activation](#activation).
 - The session is locked: olsvr does not show over a lock screen (GNOME, macOS).
 - Linux: after a failed GPU init, olsvr does not activate for 10 minutes (`GPU init failed, not activating for the next 10 min`); see [NVIDIA](#nvidia-linux) for one cause. During the pause `olsvr run --activate` and `olsvr run --now` beside the running instance report success, but the saver does not show; the log says `GPU init failed recently, not activating for another ...`
 - A GPU error or a lost GPU device hides the saver at once and logs `GPU error: ...` or `GPU device lost (...)`. The saver comes back after another full `timeout` if you are still away.

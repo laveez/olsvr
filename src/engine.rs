@@ -161,6 +161,7 @@ mod tests {
             Activation {
                 displays,
                 keep_awake: keep,
+                ..Activation::default()
             },
             ids.to_vec(),
         )

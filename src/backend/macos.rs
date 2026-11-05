@@ -26,7 +26,7 @@ use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS, Monitor
 use winit::window::{Window, WindowId, WindowLevel};
 
 use crate::compositor::{Compositor, FrameOutcome};
-use crate::config::{Config, DisplayScope};
+use crate::config::{Config, DisplayScope, inhibitor_ignored};
 use crate::data::{self, DataCache};
 use crate::engine::{BackendEvent, Engine, EngineCommand};
 use crate::{RunArgs, pidfile};
@@ -190,8 +190,9 @@ pub(crate) fn process_name(pid: i32) -> String {
 /// player or presentation keeping the screen on. The macOS analog of the Wayland inhibitor
 /// gate (`idle_inhibited_by_others`), so the saver doesn't cover playing video. Our own
 /// keep-awake assertion (held under some `keep_awake` policies) is ignored by owning PID
-/// and by name, so a second olsvr instance doesn't count either.
-fn display_sleep_inhibited() -> Option<i32> {
+/// and by name, so a second olsvr instance doesn't count either. So are the assertions of
+/// the processes `ignored` names.
+fn display_sleep_inhibited(ignored: &[String]) -> Option<i32> {
     let own_pid = std::process::id() as i32;
 
     let mut by_pid: *const c_void = std::ptr::null();
@@ -229,6 +230,9 @@ fn display_sleep_inhibited() -> Option<i32> {
                 let name = string_value(assertion, "AssertName");
                 if name.as_ref().is_some_and(|name| *name == KEEP_AWAKE_NAME) {
                     continue;
+                }
+                if !ignored.is_empty() && inhibitor_ignored(ignored, &process_name(pid)) {
+                    continue 'scan;
                 }
                 inhibitor = Some(pid);
                 break 'scan;
@@ -470,7 +474,7 @@ pub fn run(args: RunArgs) {
     };
 
     let timeout = Duration::from_secs(config.timeout as u64 * 60);
-    let engine = Engine::new(config.activation, vec![0]);
+    let engine = Engine::new(config.activation.clone(), vec![0]);
 
     // Watchdog guards against a trapped screen if the render loop ever stalls.
     let watchdog = Watchdog::new();
@@ -775,7 +779,8 @@ impl MacApp {
     /// when a hold starts and ends. Only the idle check calls it, so an end is logged
     /// at the first idle check after the hold is gone, not when it is released.
     fn display_inhibited(&mut self) -> bool {
-        match (&self.display_inhibitor, display_sleep_inhibited()) {
+        let ignored = &self.config.activation.ignore_inhibitors;
+        match (&self.display_inhibitor, display_sleep_inhibited(ignored)) {
             (None, Some(pid)) => {
                 let app = process_name(pid);
                 log::info!(
